@@ -2,9 +2,8 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build linux
 // +build linux
-
-//lint:file-ignore U1000 refactoring, temporarily unused code.
 
 package dns
 

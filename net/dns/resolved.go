@@ -2,9 +2,8 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build linux
 // +build linux
-
-//lint:file-ignore U1000 refactoring, temporarily unused code.
 
 package dns
 
@@ -69,7 +68,7 @@ func isResolvedActive() bool {
 		return false
 	}
 
-	config, err := readResolvConf()
+	config, err := newDirectManager().readResolvConf()
 	if err != nil {
 		return false
 	}
@@ -82,7 +81,7 @@ func isResolvedActive() bool {
 	return false
 }
 
-// resolvedManager uses the systemd-resolved DBus API.
+// resolvedManager is an OSConfigurator which uses the systemd-resolved DBus API.
 type resolvedManager struct {
 	logf     logger.Logf
 	ifidx    int
@@ -107,7 +106,6 @@ func newResolvedManager(logf logger.Logf, interfaceName string) (*resolvedManage
 	}, nil
 }
 
-// Up implements managerImpl.
 func (m *resolvedManager) SetDNS(config OSConfig) error {
 	ctx, cancel := context.WithTimeout(context.Background(), reconfigTimeout)
 	defer cancel()
@@ -178,7 +176,7 @@ func (m *resolvedManager) SetDNS(config OSConfig) error {
 	}
 
 	if call := m.resolved.CallWithContext(ctx, "org.freedesktop.resolve1.Manager.SetLinkDefaultRoute", 0, m.ifidx, len(config.MatchDomains) == 0); call.Err != nil {
-		return fmt.Errorf("setLinkDefaultRoute: %w", err)
+		return fmt.Errorf("setLinkDefaultRoute: %w", call.Err)
 	}
 
 	// Some best-effort setting of things, but resolved should do the

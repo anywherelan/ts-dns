@@ -7,5 +7,5 @@ package dns
 import "github.com/anywherelan/ts-dns/types/logger"
 
 func NewOSConfigurator(logger.Logf, string) (OSConfigurator, error) {
-	return newDirectManager()
+	return newDirectManager(), nil
 }

@@ -7,6 +7,7 @@ package dns
 import (
 	"sort"
 
+	"github.com/anywherelan/ts-dns/types/dnstype"
 	"github.com/anywherelan/ts-dns/util/dnsname"
 	"inet.af/netaddr"
 )
@@ -17,14 +18,14 @@ type Config struct {
 	// which aren't covered by more specific per-domain routes below.
 	// If empty, the OS's default resolvers (the ones that predate
 	// Tailscale altering the configuration) are used.
-	DefaultResolvers []netaddr.IPPort
+	DefaultResolvers []dnstype.Resolver
 	// Routes maps a DNS suffix to the resolvers that should be used
 	// for queries that fall within that suffix.
 	// If a query doesn't match any entry in Routes, the
 	// DefaultResolvers are used.
 	// A Routes entry with no resolvers means the route should be
 	// authoritatively answered using the contents of Hosts.
-	Routes map[dnsname.FQDN][]netaddr.IPPort
+	Routes map[dnsname.FQDN][]dnstype.Resolver
 	// SearchDomains are DNS suffixes to try when expanding
 	// single-label queries.
 	SearchDomains []dnsname.FQDN
@@ -48,10 +49,21 @@ func (c Config) hasRoutes() bool {
 	return len(c.Routes) > 0
 }
 
-// hasDefaultResolversOnly reports whether the only resolvers in c are
-// DefaultResolvers.
-func (c Config) hasDefaultResolversOnly() bool {
-	return c.hasDefaultResolvers() && !c.hasRoutes()
+// hasDefaultIPResolversOnly reports whether the only resolvers in c are
+// DefaultResolvers, and that those resolvers are simple IP addresses.
+func (c Config) hasDefaultIPResolversOnly() bool {
+	if !c.hasDefaultResolvers() || c.hasRoutes() {
+		return false
+	}
+	for _, r := range c.DefaultResolvers {
+		if ipp, err := netaddr.ParseIPPort(r.Addr); err == nil && ipp.Port() == 53 {
+			continue
+		}
+		if _, err := netaddr.ParseIP(r.Addr); err != nil {
+			return false
+		}
+	}
+	return true
 }
 
 func (c Config) hasDefaultResolvers() bool {
@@ -61,9 +73,9 @@ func (c Config) hasDefaultResolvers() bool {
 // singleResolverSet returns the resolvers used by c.Routes if all
 // routes use the same resolvers, or nil if multiple sets of resolvers
 // are specified.
-func (c Config) singleResolverSet() []netaddr.IPPort {
+func (c Config) singleResolverSet() []dnstype.Resolver {
 	var (
-		prev            []netaddr.IPPort
+		prev            []dnstype.Resolver
 		prevInitialized bool
 	)
 	for _, resolvers := range c.Routes {
@@ -72,7 +84,7 @@ func (c Config) singleResolverSet() []netaddr.IPPort {
 			prevInitialized = true
 			continue
 		}
-		if !sameIPPorts(prev, resolvers) {
+		if !sameResolverNames(prev, resolvers) {
 			return nil
 		}
 	}
@@ -91,16 +103,29 @@ func (c Config) matchDomains() []dnsname.FQDN {
 	return ret
 }
 
-func sameIPPorts(a, b []netaddr.IPPort) bool {
+func sameResolverNames(a, b []dnstype.Resolver) bool {
 	if len(a) != len(b) {
 		return false
 	}
+	for i := range a {
+		if a[i].Addr != b[i].Addr {
+			return false
+		}
+		if !sameIPs(a[i].BootstrapResolution, b[i].BootstrapResolution) {
+			return false
+		}
+	}
+	return true
+}
 
+func sameIPs(a, b []netaddr.IP) bool {
+	if len(a) != len(b) {
+		return false
+	}
 	for i := range a {
 		if a[i] != b[i] {
 			return false
 		}
 	}
-
 	return true
 }

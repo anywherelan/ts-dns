@@ -35,16 +35,18 @@ const (
 )
 
 type windowsManager struct {
-	logf      logger.Logf
-	guid      string
-	nrptWorks bool
+	logf       logger.Logf
+	guid       string
+	nrptWorks  bool
+	wslManager *wslManager
 }
 
 func NewOSConfigurator(logf logger.Logf, interfaceName string) (OSConfigurator, error) {
 	ret := windowsManager{
-		logf:      logf,
-		guid:      interfaceName,
-		nrptWorks: !isWindows7(),
+		logf:       logf,
+		guid:       interfaceName,
+		nrptWorks:  isWindows10OrBetter(),
+		wslManager: newWSLManager(logf),
 	}
 
 	// Best-effort: if our NRPT rule exists, try to delete it. Unlike
@@ -55,6 +57,13 @@ func NewOSConfigurator(logf logger.Logf, interfaceName string) (OSConfigurator, 
 	// slows down start-up a bunch.
 	if ret.nrptWorks {
 		ret.delKey(nrptBase)
+	}
+
+	// Log WSL status once at startup.
+	if distros, err := wslDistros(); err != nil {
+		logf("WSL: could not list distributions: %v", err)
+	} else {
+		logf("WSL: found %d distributions", len(distros))
 	}
 
 	return ret, nil
@@ -284,7 +293,7 @@ func (m windowsManager) SetDNS(cfg OSConfig) error {
 		}
 
 		t0 = time.Now()
-		m.logf("running ipconfig /registerdns ...")
+		m.logf("running ipconfig /flushdns ...")
 		cmd = exec.Command("ipconfig", "/flushdns")
 		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 		err = cmd.Run()
@@ -293,6 +302,16 @@ func (m windowsManager) SetDNS(cfg OSConfig) error {
 			m.logf("error running ipconfig /flushdns after %v: %v", d, err)
 		} else {
 			m.logf("ran ipconfig /flushdns in %v", d)
+		}
+	}()
+
+	// On initial setup of WSL, the restart caused by --shutdown is slow,
+	// so we do it out-of-line.
+	go func() {
+		if err := m.wslManager.SetDNS(cfg); err != nil {
+			m.logf("WSL SetDNS: %v", err) // continue
+		} else {
+			m.logf("WSL SetDNS: success")
 		}
 	}()
 
@@ -407,22 +426,16 @@ var siteLocalResolvers = []netaddr.IP{
 	netaddr.MustParseIP("fec0:0:0:ffff::3"),
 }
 
-func isWindows7() bool {
+func isWindows10OrBetter() bool {
 	key, err := registry.OpenKey(registry.LOCAL_MACHINE, versionKey, registry.READ)
 	if err != nil {
-		// Fail safe, assume Windows 7.
-		return true
+		// Fail safe, assume old Windows.
+		return false
 	}
-	ver, _, err := key.GetStringValue("CurrentVersion")
-	if err != nil {
-		return true
+	// This key above only exists in Windows 10 and above. Its mere
+	// presence is good enough.
+	if _, _, err := key.GetIntegerValue("CurrentMajorVersionNumber"); err != nil {
+		return false
 	}
-	// Careful to not assume anything about version numbers beyond
-	// 6.3, Microsoft deprecated this registry key and locked its
-	// value to what it was in Windows 8.1. We can only use this to
-	// probe for versions before that. Good thing we only need Windows
-	// 7 (so far).
-	//
-	// And yes, Windows 7 is version 6.1. Don't ask.
-	return ver == "6.1"
+	return true
 }

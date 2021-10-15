@@ -2,22 +2,21 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build linux freebsd openbsd
-
 package dns
 
 import (
 	"bufio"
 	"bytes"
+	"crypto/rand"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 
-	"github.com/anywherelan/ts-dns/atomicfile"
 	"github.com/anywherelan/ts-dns/util/dnsname"
 	"inet.af/netaddr"
 )
@@ -77,21 +76,17 @@ func readResolv(r io.Reader) (config OSConfig, err error) {
 	return config, nil
 }
 
-func readResolvFile(path string) (OSConfig, error) {
-	var config OSConfig
-
-	f, err := os.Open(path)
+func (m directManager) readResolvFile(path string) (OSConfig, error) {
+	b, err := m.fs.ReadFile(path)
 	if err != nil {
-		return config, err
+		return OSConfig{}, err
 	}
-	defer f.Close()
-
-	return readResolv(f)
+	return readResolv(bytes.NewReader(b))
 }
 
 // readResolvConf reads DNS configuration from /etc/resolv.conf.
-func readResolvConf() (OSConfig, error) {
-	return readResolvFile(resolvConf)
+func (m directManager) readResolvConf() (OSConfig, error) {
+	return m.readResolvFile(resolvConf)
 }
 
 // resolvOwner returns the apparent owner of the resolv.conf
@@ -143,33 +138,39 @@ func isResolvedRunning() bool {
 	return err == nil
 }
 
-// directManager is a managerImpl which replaces /etc/resolv.conf with a file
+// directManager is an OSConfigurator which replaces /etc/resolv.conf with a file
 // generated from the given configuration, creating a backup of its old state.
 //
 // This way of configuring DNS is precarious, since it does not react
 // to the disappearance of the Tailscale interface.
 // The caller must call Down before program shutdown
 // or as cleanup if the program terminates unexpectedly.
-type directManager struct{}
+type directManager struct {
+	fs wholeFileFS
+}
 
-func newDirectManager() (directManager, error) {
-	return directManager{}, nil
+func newDirectManager() directManager {
+	return directManager{fs: directFS{}}
+}
+
+func newDirectManagerOnFS(fs wholeFileFS) directManager {
+	return directManager{fs: fs}
 }
 
 // ownedByTailscale reports whether /etc/resolv.conf seems to be a
 // tailscale-managed file.
 func (m directManager) ownedByTailscale() (bool, error) {
-	st, err := os.Stat(resolvConf)
+	isRegular, err := m.fs.Stat(resolvConf)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return false, nil
 		}
 		return false, err
 	}
-	if !st.Mode().IsRegular() {
+	if !isRegular {
 		return false, nil
 	}
-	bs, err := ioutil.ReadFile(resolvConf)
+	bs, err := m.fs.ReadFile(resolvConf)
 	if err != nil {
 		return false, err
 	}
@@ -182,11 +183,11 @@ func (m directManager) ownedByTailscale() (bool, error) {
 // backupConfig creates or updates a backup of /etc/resolv.conf, if
 // resolv.conf does not currently contain a Tailscale-managed config.
 func (m directManager) backupConfig() error {
-	if _, err := os.Stat(resolvConf); err != nil {
+	if _, err := m.fs.Stat(resolvConf); err != nil {
 		if os.IsNotExist(err) {
 			// No resolv.conf, nothing to back up. Also get rid of any
 			// existing backup file, to avoid restoring something old.
-			os.Remove(backupConf)
+			m.fs.Remove(backupConf)
 			return nil
 		}
 		return err
@@ -200,54 +201,58 @@ func (m directManager) backupConfig() error {
 		return nil
 	}
 
-	return os.Rename(resolvConf, backupConf)
+	return m.fs.Rename(resolvConf, backupConf)
 }
 
-func (m directManager) restoreBackup() error {
-	if _, err := os.Stat(backupConf); err != nil {
+func (m directManager) restoreBackup() (restored bool, err error) {
+	if _, err := m.fs.Stat(backupConf); err != nil {
 		if os.IsNotExist(err) {
 			// No backup, nothing we can do.
-			return nil
+			return false, nil
 		}
-		return err
+		return false, err
 	}
 	owned, err := m.ownedByTailscale()
 	if err != nil {
-		return err
+		return false, err
 	}
-	if _, err := os.Stat(resolvConf); err != nil && !os.IsNotExist(err) {
-		return err
+	_, err = m.fs.Stat(resolvConf)
+	if err != nil && !os.IsNotExist(err) {
+		return false, err
 	}
 	resolvConfExists := !os.IsNotExist(err)
 
 	if resolvConfExists && !owned {
 		// There's already a non-tailscale config in place, get rid of
 		// our backup.
-		os.Remove(backupConf)
-		return nil
+		m.fs.Remove(backupConf)
+		return false, nil
 	}
 
 	// We own resolv.conf, and a backup exists.
-	if err := os.Rename(backupConf, resolvConf); err != nil {
-		return err
+	if err := m.fs.Rename(backupConf, resolvConf); err != nil {
+		return false, err
 	}
 
-	return nil
+	return true, nil
 }
 
-func (m directManager) SetDNS(config OSConfig) error {
+func (m directManager) SetDNS(config OSConfig) (err error) {
+	var changed bool
 	if config.IsZero() {
-		if err := m.restoreBackup(); err != nil {
+		changed, err = m.restoreBackup()
+		if err != nil {
 			return err
 		}
 	} else {
+		changed = true
 		if err := m.backupConfig(); err != nil {
 			return err
 		}
 
 		buf := new(bytes.Buffer)
 		writeResolvConf(buf, config.Nameservers, config.SearchDomains)
-		if err := atomicfile.WriteFile(resolvConf, buf.Bytes(), 0644); err != nil {
+		if err := atomicWriteFile(m.fs, resolvConf, buf.Bytes(), 0644); err != nil {
 			return err
 		}
 	}
@@ -258,7 +263,17 @@ func (m directManager) SetDNS(config OSConfig) error {
 	// try to manage DNS through resolved when it's around, but as a
 	// best-effort fallback if we messed up the detection, try to
 	// restart resolved to make the system configuration consistent.
-	if isResolvedRunning() {
+	//
+	// We take care to only kick systemd-resolved if we've made some
+	// change to the system's DNS configuration, because this codepath
+	// can end up running in cases where the user has manually
+	// configured /etc/resolv.conf to point to systemd-resolved (but
+	// it's not managed explicitly by systemd-resolved), *and* has
+	// --accept-dns=false, meaning we pass an empty configuration to
+	// the running DNS manager. In that very edge-case scenario, we
+	// cause a disruptive DNS outage each time we reset an empty
+	// OS configuration.
+	if changed && isResolvedRunning() && !runningAsGUIDesktopUser() {
 		exec.Command("systemctl", "restart", "systemd-resolved.service").Run()
 	}
 
@@ -279,7 +294,7 @@ func (m directManager) GetBaseConfig() (OSConfig, error) {
 		fileToRead = backupConf
 	}
 
-	return readResolvFile(fileToRead)
+	return m.readResolvFile(fileToRead)
 }
 
 func (m directManager) Close() error {
@@ -287,9 +302,9 @@ func (m directManager) Close() error {
 	// to it, but then we stopped because /etc/resolv.conf being a
 	// symlink to surprising places breaks snaps and other sandboxing
 	// things. Clean it up if it's still there.
-	os.Remove("/etc/resolv.tailscale.conf")
+	m.fs.Remove("/etc/resolv.tailscale.conf")
 
-	if _, err := os.Stat(backupConf); err != nil {
+	if _, err := m.fs.Stat(backupConf); err != nil {
 		if os.IsNotExist(err) {
 			// No backup, nothing we can do.
 			return nil
@@ -300,7 +315,7 @@ func (m directManager) Close() error {
 	if err != nil {
 		return err
 	}
-	_, err = os.Stat(resolvConf)
+	_, err = m.fs.Stat(resolvConf)
 	if err != nil && !os.IsNotExist(err) {
 		return err
 	}
@@ -309,18 +324,87 @@ func (m directManager) Close() error {
 	if resolvConfExists && !owned {
 		// There's already a non-tailscale config in place, get rid of
 		// our backup.
-		os.Remove(backupConf)
+		m.fs.Remove(backupConf)
 		return nil
 	}
 
 	// We own resolv.conf, and a backup exists.
-	if err := os.Rename(backupConf, resolvConf); err != nil {
+	if err := m.fs.Rename(backupConf, resolvConf); err != nil {
 		return err
 	}
 
-	if isResolvedRunning() {
+	if isResolvedRunning() && !runningAsGUIDesktopUser() {
 		exec.Command("systemctl", "restart", "systemd-resolved.service").Run() // Best-effort.
 	}
 
 	return nil
+}
+
+func atomicWriteFile(fs wholeFileFS, filename string, data []byte, perm os.FileMode) error {
+	var randBytes [12]byte
+	if _, err := rand.Read(randBytes[:]); err != nil {
+		return fmt.Errorf("atomicWriteFile: %w", err)
+	}
+
+	tmpName := fmt.Sprintf("%s.%x.tmp", filename, randBytes[:])
+	defer fs.Remove(tmpName)
+
+	if err := fs.WriteFile(tmpName, data, perm); err != nil {
+		return fmt.Errorf("atomicWriteFile: %w", err)
+	}
+	return fs.Rename(tmpName, filename)
+}
+
+// wholeFileFS is a high-level file system abstraction designed just for use
+// by directManager, with the goal that it is easy to implement over wsl.exe.
+//
+// All name parameters are absolute paths.
+type wholeFileFS interface {
+	Stat(name string) (isRegular bool, err error)
+	Rename(oldName, newName string) error
+	Remove(name string) error
+	ReadFile(name string) ([]byte, error)
+	WriteFile(name string, contents []byte, perm os.FileMode) error
+}
+
+// directFS is a wholeFileFS implemented directly on the OS.
+type directFS struct {
+	// prefix is file path prefix.
+	//
+	// All name parameters are absolute paths so this is typically a
+	// testing temporary directory like "/tmp".
+	prefix string
+}
+
+func (fs directFS) path(name string) string { return filepath.Join(fs.prefix, name) }
+
+func (fs directFS) Stat(name string) (isRegular bool, err error) {
+	fi, err := os.Stat(fs.path(name))
+	if err != nil {
+		return false, err
+	}
+	return fi.Mode().IsRegular(), nil
+}
+
+func (fs directFS) Rename(oldName, newName string) error {
+	return os.Rename(fs.path(oldName), fs.path(newName))
+}
+
+func (fs directFS) Remove(name string) error { return os.Remove(fs.path(name)) }
+
+func (fs directFS) ReadFile(name string) ([]byte, error) {
+	return ioutil.ReadFile(fs.path(name))
+}
+
+func (fs directFS) WriteFile(name string, contents []byte, perm os.FileMode) error {
+	return ioutil.WriteFile(fs.path(name), contents, perm)
+}
+
+// runningAsGUIDesktopUser reports whether it seems that this code is
+// being run as a regular user on a Linux desktop. This is a quick
+// hack to fix Issue 2672 where PolicyKit pops up a GUI dialog asking
+// to proceed we do a best effort attempt to restart
+// systemd-resolved.service. There's surely a better way.
+func runningAsGUIDesktopUser() bool {
+	return os.Getuid() != 0 && os.Getenv("DISPLAY") != ""
 }

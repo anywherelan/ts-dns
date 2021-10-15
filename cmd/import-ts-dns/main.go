@@ -34,7 +34,7 @@ func main() {
 	netOutputPath := filepath.Join(outputDir, "net")
 	os.MkdirAll(netOutputPath, 0777)
 	copyFiles(filepath.Join(cloneDir, "net", "dns"), netOutputPath)
-	removeFiles(filepath.Join(outputDir, "net", "dns"), "resolver", "manager.go", "manager_test.go")
+	removeFiles(filepath.Join(outputDir, "net", "dns"), "resolver", "manager.go", "manager_test.go", "manager_linux_test.go")
 	os.WriteFile(filepath.Join(outputDir, "net", "dns", "manager.go"), managerFile, 0666)
 
 	netInterfacesOutputPath := filepath.Join(netOutputPath, "interfaces")
@@ -46,12 +46,14 @@ func main() {
 	copyFiles(filepath.Join(cloneDir, "util", "dnsname"), utilOutputPath)
 	copyFiles(filepath.Join(cloneDir, "util", "cmpver"), utilOutputPath)
 	copyFiles(filepath.Join(cloneDir, "util", "endian"), utilOutputPath)
+	copyFiles(filepath.Join(cloneDir, "util", "winutil"), utilOutputPath)
 
 	copyFiles(filepath.Join(cloneDir, "atomicfile"), outputDir)
 
 	typesOutputPath := filepath.Join(outputDir, "types")
 	os.MkdirAll(typesOutputPath, 0777)
 	copyFiles(filepath.Join(cloneDir, "types", "logger"), typesOutputPath)
+	copyFiles(filepath.Join(cloneDir, "types", "dnstype"), typesOutputPath)
 
 	recursiveReplaceInFiles(outputDir, `"tailscale.com/`, `"github.com/anywherelan/ts-dns/`)
 	recursiveReplaceInFiles(filepath.Join(outputDir, "go.mod"), "module tailscale.com", "module github.com/anywherelan/ts-dns")
