@@ -1,24 +1,30 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 //go:build !windows
-// +build !windows
 
 package winutil
 
-const RegBase = ``
+import (
+	"fmt"
+	"os/user"
+	"runtime"
+)
 
-// GetRegString looks up a registry path in our local machine path, or returns
-// the given default if it can't.
-//
-// This function will only work on GOOS=windows. Trying to run it on any other
-// OS will always return the default value.
-func GetRegString(name, defval string) string { return defval }
+const regBase = ``
 
-// GetRegInteger looks up a registry path in our local machine path, or returns
-// the given default if it can't.
-//
-// This function will only work on GOOS=windows. Trying to run it on any other
-// OS will always return the default value.
-func GetRegInteger(name string, defval uint64) uint64 { return defval }
+func getPolicyString(name, defval string) string { return defval }
+
+func getPolicyInteger(name string, defval uint64) uint64 { return defval }
+
+func getRegString(name, defval string) string { return defval }
+
+func getRegInteger(name string, defval uint64) uint64 { return defval }
+
+func isSIDValidPrincipal(uid string) bool { return false }
+
+func lookupPseudoUser(uid string) (*user.User, error) {
+	return nil, fmt.Errorf("unimplemented on %v", runtime.GOOS)
+}
+
+func IsCurrentProcessElevated() bool { return false }

@@ -1,20 +1,19 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
-//go:build !windows
-// +build !windows
+//go:build !windows && !js
 
 package logger
 
 import (
 	"runtime"
-	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 func rusageMaxRSS() float64 {
-	var ru syscall.Rusage
-	err := syscall.Getrusage(syscall.RUSAGE_SELF, &ru)
+	var ru unix.Rusage
+	err := unix.Getrusage(unix.RUSAGE_SELF, &ru)
 	if err != nil {
 		return 0
 	}

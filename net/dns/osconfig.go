@@ -1,14 +1,16 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package dns
 
 import (
+	"bufio"
 	"errors"
+	"fmt"
+	"net/netip"
 
+	"github.com/anywherelan/ts-dns/types/logger"
 	"github.com/anywherelan/ts-dns/util/dnsname"
-	"inet.af/netaddr"
 )
 
 // An OSConfigurator applies DNS settings to the operating system.
@@ -17,6 +19,7 @@ type OSConfigurator interface {
 	// If cfg is the zero value, all Tailscale-related DNS
 	// configuration is removed.
 	// SetDNS must not be called after Close.
+	// SetDNS takes ownership of cfg.
 	SetDNS(cfg OSConfig) error
 	// SupportsSplitDNS reports whether the configurator is capable of
 	// installing a resolver only for specific DNS suffixes. If false,
@@ -36,10 +39,20 @@ type OSConfigurator interface {
 	Close() error
 }
 
+// HostEntry represents a single line in the OS's hosts file.
+type HostEntry struct {
+	Addr  netip.Addr
+	Hosts []string
+}
+
 // OSConfig is an OS DNS configuration.
 type OSConfig struct {
+	// Hosts is a map of DNS FQDNs to their IPs, which should be added to the
+	// OS's hosts file. Currently, (2022-08-12) it is only populated for Windows
+	// in SplitDNS mode and with Smart Name Resolution turned on.
+	Hosts []*HostEntry
 	// Nameservers are the IP addresses of the nameservers to use.
-	Nameservers []netaddr.IP
+	Nameservers []netip.Addr
 	// SearchDomains are the domain suffixes to use when expanding
 	// single-label name queries. SearchDomains is additive to
 	// whatever non-Tailscale search domains the OS has.
@@ -84,6 +97,44 @@ func (a OSConfig) Equal(b OSConfig) bool {
 	}
 
 	return true
+}
+
+// Format implements the fmt.Formatter interface to ensure that Hosts is
+// printed correctly (i.e. not as a bunch of pointers).
+//
+// Fixes https://github.com/tailscale/tailscale/issues/5669
+func (a OSConfig) Format(f fmt.State, verb rune) {
+	logger.ArgWriter(func(w *bufio.Writer) {
+		w.WriteString(`{Nameservers:[`)
+		for i, ns := range a.Nameservers {
+			if i != 0 {
+				w.WriteString(" ")
+			}
+			fmt.Fprintf(w, "%+v", ns)
+		}
+		w.WriteString(`] SearchDomains:[`)
+		for i, domain := range a.SearchDomains {
+			if i != 0 {
+				w.WriteString(" ")
+			}
+			fmt.Fprintf(w, "%+v", domain)
+		}
+		w.WriteString(`] MatchDomains:[`)
+		for i, domain := range a.MatchDomains {
+			if i != 0 {
+				w.WriteString(" ")
+			}
+			fmt.Fprintf(w, "%+v", domain)
+		}
+		w.WriteString(`] Hosts:[`)
+		for i, host := range a.Hosts {
+			if i != 0 {
+				w.WriteString(" ")
+			}
+			fmt.Fprintf(w, "%+v", host)
+		}
+		w.WriteString(`]}`)
+	}).Format(f, verb)
 }
 
 // ErrGetBaseConfigNotSupported is the error

@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package dnsname
 
@@ -104,7 +103,7 @@ func TestSanitizeLabel(t *testing.T) {
 		{"mixed", "Avery's iPhone 4(SE)", "averys-iphone-4se"},
 		{"dotted", "mon.ipn.dev", "mon-ipn-dev"},
 		{"email", "admin@example.com", "admin-example-com"},
-		{"boudary", ".bound.ary.", "bound-ary"},
+		{"boundary", ".bound.ary.", "bound-ary"},
 		{"bad_trailing", "a-", "a"},
 		{"bad_leading", "-a", "a"},
 		{"bad_both", "-a-", "a"},
@@ -183,6 +182,31 @@ func TestTrimSuffix(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("TrimSuffix(%q, %q) = %q; want %q", tt.name, tt.suffix, got, tt.want)
 		}
+	}
+}
+
+func TestValidHostname(t *testing.T) {
+	tests := []struct {
+		hostname string
+		wantErr  string
+	}{
+		{"example", ""},
+		{"example.com", ""},
+		{" example", `must start with a letter or number`},
+		{"example-.com", `must end with a letter or number`},
+		{strings.Repeat("a", 63), ""},
+		{strings.Repeat("a", 64), `is too long, max length is 63 bytes`},
+		{strings.Repeat(strings.Repeat("a", 63)+".", 4), "is too long to be a DNS name"},
+		{"www.what🤦lol.example.com", "contains invalid character"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.hostname, func(t *testing.T) {
+			err := ValidHostname(test.hostname)
+			if (err == nil) != (test.wantErr == "") || (err != nil && !strings.Contains(err.Error(), test.wantErr)) {
+				t.Fatalf("ValidHostname(%s)=%v; expected %v", test.hostname, err, test.wantErr)
+			}
+		})
 	}
 }
 

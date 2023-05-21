@@ -1,23 +1,21 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 //go:build linux
-// +build linux
 
 package dns
 
 import (
 	"context"
 	"fmt"
+	"net/netip"
 	"sort"
 	"time"
 
 	"github.com/anywherelan/ts-dns/net/interfaces"
 	"github.com/anywherelan/ts-dns/util/dnsname"
-	"github.com/anywherelan/ts-dns/util/endian"
 	"github.com/godbus/dbus/v5"
-	"inet.af/netaddr"
+	"github.com/josharian/native"
 )
 
 const (
@@ -131,7 +129,7 @@ func (m *nmManager) trySet(ctx context.Context, config OSConfig) error {
 	for _, ip := range config.Nameservers {
 		b := ip.As16()
 		if ip.Is4() {
-			dnsv4 = append(dnsv4, endian.Native.Uint32(b[12:]))
+			dnsv4 = append(dnsv4, native.Endian.Uint32(b[12:]))
 		} else {
 			dnsv6 = append(dnsv6, b[:])
 		}
@@ -140,12 +138,12 @@ func (m *nmManager) trySet(ctx context.Context, config OSConfig) error {
 	// NetworkManager wipes out IPv6 address configuration unless we
 	// tell it explicitly to keep it. Read out the current interface
 	// settings and mirror them out to NetworkManager.
-	var addrs6 []map[string]interface{}
+	var addrs6 []map[string]any
 	addrs, _, err := interfaces.Tailscale()
 	if err == nil {
 		for _, a := range addrs {
 			if a.Is6() {
-				addrs6 = append(addrs6, map[string]interface{}{
+				addrs6 = append(addrs6, map[string]any{
 					"address": a.String(),
 					"prefix":  uint32(128),
 				})
@@ -293,7 +291,7 @@ func (m *nmManager) GetBaseConfig() (OSConfig, error) {
 	}
 
 	type dnsPrio struct {
-		resolvers []netaddr.IP
+		resolvers []netip.Addr
 		domains   []string
 		priority  int32
 	}
@@ -302,7 +300,7 @@ func (m *nmManager) GetBaseConfig() (OSConfig, error) {
 	for _, cfg := range cfgs {
 		if name, ok := cfg["interface"]; ok {
 			if s, ok := name.Value().(string); ok && s == m.interfaceName {
-				// Config for the taislcale interface, skip.
+				// Config for the tailscale interface, skip.
 				continue
 			}
 		}
@@ -312,7 +310,7 @@ func (m *nmManager) GetBaseConfig() (OSConfig, error) {
 		if v, ok := cfg["nameservers"]; ok {
 			if ips, ok := v.Value().([]string); ok {
 				for _, s := range ips {
-					ip, err := netaddr.ParseIP(s)
+					ip, err := netip.ParseAddr(s)
 					if err != nil {
 						// hmm, what do? Shouldn't really happen.
 						continue
@@ -341,7 +339,7 @@ func (m *nmManager) GetBaseConfig() (OSConfig, error) {
 
 	var (
 		ret           OSConfig
-		seenResolvers = map[netaddr.IP]bool{}
+		seenResolvers = map[netip.Addr]bool{}
 		seenSearch    = map[string]bool{}
 	)
 

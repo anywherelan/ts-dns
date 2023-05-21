@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package dns
 
@@ -10,12 +9,16 @@ import (
 	"errors"
 	"fmt"
 	"os"
+
+	"sync"
 	"time"
 
+	"github.com/anywherelan/ts-dns/health"
+	"github.com/anywherelan/ts-dns/net/netaddr"
 	"github.com/anywherelan/ts-dns/types/logger"
-	"github.com/anywherelan/ts-dns/util/cmpver"
 	"github.com/godbus/dbus/v5"
-	"inet.af/netaddr"
+
+	"github.com/anywherelan/ts-dns/util/cmpver"
 )
 
 type kv struct {
@@ -26,10 +29,13 @@ func (kv kv) String() string {
 	return fmt.Sprintf("%s=%s", kv.k, kv.v)
 }
 
+var publishOnce sync.Once
+
 func NewOSConfigurator(logf logger.Logf, interfaceName string) (ret OSConfigurator, err error) {
 	env := newOSConfigEnv{
 		fs:                directFS{},
 		dbusPing:          dbusPing,
+		dbusReadString:    dbusReadString,
 		nmIsUsingResolved: nmIsUsingResolved,
 		nmVersionBetween:  nmVersionBetween,
 		resolvconfStyle:   resolvconfStyle,
@@ -38,9 +44,11 @@ func NewOSConfigurator(logf logger.Logf, interfaceName string) (ret OSConfigurat
 	if err != nil {
 		return nil, err
 	}
+
+	logf("dns: using %q mode", mode)
 	switch mode {
 	case "direct":
-		return newDirectManagerOnFS(env.fs), nil
+		return newDirectManagerOnFS(logf, env.fs), nil
 	case "systemd-resolved":
 		return newResolvedManager(logf, interfaceName)
 	case "network-manager":
@@ -51,7 +59,7 @@ func NewOSConfigurator(logf logger.Logf, interfaceName string) (ret OSConfigurat
 		return newOpenresolvManager()
 	default:
 		logf("[unexpected] detected unknown DNS mode %q, using direct manager as last resort", mode)
-		return newDirectManagerOnFS(env.fs), nil
+		return newDirectManagerOnFS(logf, env.fs), nil
 	}
 }
 
@@ -59,6 +67,7 @@ func NewOSConfigurator(logf logger.Logf, interfaceName string) (ret OSConfigurat
 type newOSConfigEnv struct {
 	fs                        wholeFileFS
 	dbusPing                  func(string, string) error
+	dbusReadString            func(string, string, string, string) (string, error)
 	nmIsUsingResolved         func() error
 	nmVersionBetween          func(v1, v2 string) (safe bool, err error)
 	resolvconfStyle           func() string
@@ -77,6 +86,37 @@ func dnsMode(logf logger.Logf, env newOSConfigEnv) (ret string, err error) {
 		logf("dns: %v", debug)
 	}()
 
+	// In all cases that we detect systemd-resolved, try asking it what it
+	// thinks the current resolv.conf mode is so we can add it to our logs.
+	defer func() {
+		if ret != "systemd-resolved" {
+			return
+		}
+
+		// Try to ask systemd-resolved what it thinks the current
+		// status of resolv.conf is. This is documented at:
+		//    https://www.freedesktop.org/software/systemd/man/org.freedesktop.resolve1.html
+		mode, err := env.dbusReadString("org.freedesktop.resolve1", "/org/freedesktop/resolve1", "org.freedesktop.resolve1.Manager", "ResolvConfMode")
+		if err != nil {
+			logf("dns: ResolvConfMode error: %v", err)
+			dbg("resolv-conf-mode", "error")
+		} else {
+			dbg("resolv-conf-mode", mode)
+		}
+	}()
+
+	// Before we read /etc/resolv.conf (which might be in a broken
+	// or symlink-dangling state), try to ping the D-Bus service
+	// for systemd-resolved. If it's active on the machine, this
+	// will make it start up and write the /etc/resolv.conf file
+	// before it replies to the ping. (see how systemd's
+	// src/resolve/resolved.c calls manager_write_resolv_conf
+	// before the sd_event_loop starts)
+	resolvedUp := env.dbusPing("org.freedesktop.resolve1", "/org/freedesktop/resolve1") == nil
+	if resolvedUp {
+		dbg("resolved-ping", "yes")
+	}
+
 	bs, err := env.fs.ReadFile(resolvConf)
 	if os.IsNotExist(err) {
 		dbg("rc", "missing")
@@ -89,17 +129,15 @@ func dnsMode(logf logger.Logf, env newOSConfigEnv) (ret string, err error) {
 	switch resolvOwner(bs) {
 	case "systemd-resolved":
 		dbg("rc", "resolved")
+
 		// Some systems, for reasons known only to them, have a
 		// resolv.conf that has the word "systemd-resolved" in its
 		// header, but doesn't actually point to resolved. We mustn't
 		// try to program resolved in that case.
 		// https://github.com/tailscale/tailscale/issues/2136
 		if err := resolvedIsActuallyResolver(bs); err != nil {
+			logf("dns: resolvedIsActuallyResolver error: %v", err)
 			dbg("resolved", "not-in-use")
-			return "direct", nil
-		}
-		if err := env.dbusPing("org.freedesktop.resolve1", "/org/freedesktop/resolve1"); err != nil {
-			dbg("resolved", "no")
 			return "direct", nil
 		}
 		if err := env.dbusPing("org.freedesktop.NetworkManager", "/org/freedesktop/NetworkManager/DnsManager"); err != nil {
@@ -180,20 +218,52 @@ func dnsMode(logf logger.Logf, env newOSConfigEnv) (ret string, err error) {
 			return "direct", nil
 		}
 	case "NetworkManager":
-		// You'd think we would use newNMManager somewhere in
-		// here. However, as explained in
-		// https://github.com/tailscale/tailscale/issues/1699 , using
-		// NetworkManager for DNS configuration carries with it the
-		// cost of losing IPv6 configuration on the Tailscale network
-		// interface. So, when we can avoid it, we bypass
-		// NetworkManager by replacing resolv.conf directly.
-		//
-		// If you ever try to put NMManager back here, keep in mind
-		// that versions >=1.26.6 will ignore DNS configuration
-		// anyway, so you still need a fallback path that uses
-		// directManager.
 		dbg("rc", "nm")
-		return "direct", nil
+		// Sometimes, NetworkManager owns the configuration but points
+		// it at systemd-resolved.
+		if err := resolvedIsActuallyResolver(bs); err != nil {
+			logf("dns: resolvedIsActuallyResolver error: %v", err)
+			dbg("resolved", "not-in-use")
+			// You'd think we would use newNMManager here. However, as
+			// explained in
+			// https://github.com/tailscale/tailscale/issues/1699 ,
+			// using NetworkManager for DNS configuration carries with
+			// it the cost of losing IPv6 configuration on the
+			// Tailscale network interface. So, when we can avoid it,
+			// we bypass NetworkManager by replacing resolv.conf
+			// directly.
+			//
+			// If you ever try to put NMManager back here, keep in mind
+			// that versions >=1.26.6 will ignore DNS configuration
+			// anyway, so you still need a fallback path that uses
+			// directManager.
+			return "direct", nil
+		}
+		dbg("nm-resolved", "yes")
+
+		// See large comment above for reasons we'd use NM rather than
+		// resolved. systemd-resolved is actually in charge of DNS
+		// configuration, but in some cases we might need to configure
+		// it via NetworkManager. All the logic below is probing for
+		// that case: is NetworkManager running? If so, is it one of
+		// the versions that requires direct interaction with it?
+		if err := env.dbusPing("org.freedesktop.NetworkManager", "/org/freedesktop/NetworkManager/DnsManager"); err != nil {
+			dbg("nm", "no")
+			return "systemd-resolved", nil
+		}
+		safe, err := env.nmVersionBetween("1.26.0", "1.26.5")
+		if err != nil {
+			// Failed to figure out NM's version, can't make a correct
+			// decision.
+			return "", fmt.Errorf("checking NetworkManager version: %v", err)
+		}
+		if safe {
+			dbg("nm-safe", "yes")
+			return "network-manager", nil
+		}
+		health.SetDNSManagerHealth(errors.New("systemd-resolved and NetworkManager are wired together incorrectly; MagicDNS will probably not work. For more info, see https://tailscale.com/s/resolved-nm"))
+		dbg("nm-safe", "no")
+		return "systemd-resolved", nil
 	default:
 		dbg("rc", "unknown")
 		return "direct", nil
@@ -244,6 +314,13 @@ func nmIsUsingResolved() error {
 	return nil
 }
 
+// resolvedIsActuallyResolver reports whether the given resolv.conf
+// bytes describe a configuration where systemd-resolved (127.0.0.53)
+// is the only configured nameserver.
+//
+// Returns an error if the configuration is something other than
+// exclusively systemd-resolved, or nil if the config is only
+// systemd-resolved.
 func resolvedIsActuallyResolver(bs []byte) error {
 	cfg, err := readResolv(bytes.NewBuffer(bs))
 	if err != nil {
@@ -258,23 +335,49 @@ func resolvedIsActuallyResolver(bs []byte) error {
 	}
 	for _, ns := range cfg.Nameservers {
 		if ns != netaddr.IPv4(127, 0, 0, 53) {
-			return errors.New("resolv.conf doesn't point to systemd-resolved")
+			return fmt.Errorf("resolv.conf doesn't point to systemd-resolved; points to %v", cfg.Nameservers)
 		}
 	}
 	return nil
 }
 
 func dbusPing(name, objectPath string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-
 	conn, err := dbus.SystemBus()
 	if err != nil {
 		// DBus probably not running.
 		return err
 	}
 
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
 	obj := conn.Object(name, dbus.ObjectPath(objectPath))
 	call := obj.CallWithContext(ctx, "org.freedesktop.DBus.Peer.Ping", 0)
 	return call.Err
+}
+
+// dbusReadString reads a string property from the provided name and object
+// path. property must be in "interface.member" notation.
+func dbusReadString(name, objectPath, iface, member string) (string, error) {
+	conn, err := dbus.SystemBus()
+	if err != nil {
+		// DBus probably not running.
+		return "", err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	obj := conn.Object(name, dbus.ObjectPath(objectPath))
+
+	var result dbus.Variant
+	err = obj.CallWithContext(ctx, "org.freedesktop.DBus.Properties.Get", 0, iface, member).Store(&result)
+	if err != nil {
+		return "", err
+	}
+
+	if s, ok := result.Value().(string); ok {
+		return s, nil
+	}
+	return result.String(), nil
 }

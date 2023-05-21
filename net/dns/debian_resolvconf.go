@@ -1,9 +1,7 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 //go:build linux || freebsd || openbsd
-// +build linux freebsd openbsd
 
 package dns
 
@@ -12,7 +10,6 @@ import (
 	"bytes"
 	_ "embed"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -158,7 +155,7 @@ func (m *resolvconfManager) GetBaseConfig() (OSConfig, error) {
 		if sc.Text() == resolvconfConfigName {
 			continue
 		}
-		bs, err := ioutil.ReadFile(filepath.Join(m.interfacesDir, sc.Text()))
+		bs, err := os.ReadFile(filepath.Join(m.interfacesDir, sc.Text()))
 		if err != nil {
 			if os.IsNotExist(err) {
 				// Probably raced with a deletion, that's okay.

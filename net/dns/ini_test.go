@@ -1,9 +1,7 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 //go:build windows
-// +build windows
 
 package dns
 
@@ -26,8 +24,8 @@ func TestParseIni(t *testing.T) {
 [network] # trailing comment
 generateResolvConf = false  # trailing comment`,
 			want: map[string]map[string]string{
-				"automount": map[string]string{"enabled": "true", "root": "/mnt/"},
-				"network":   map[string]string{"generateResolvConf": "false"},
+				"automount": {"enabled": "true", "root": "/mnt/"},
+				"network":   {"generateResolvConf": "false"},
 			},
 		},
 	}

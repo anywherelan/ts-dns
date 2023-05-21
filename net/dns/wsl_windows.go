@@ -1,18 +1,19 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package dns
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"os/user"
 	"strings"
 	"syscall"
-	"unicode/utf16"
+	"time"
 
 	"github.com/anywherelan/ts-dns/types/logger"
 	"github.com/anywherelan/ts-dns/util/winutil"
@@ -21,34 +22,18 @@ import (
 
 // wslDistros reports the names of the installed WSL2 linux distributions.
 func wslDistros() ([]string, error) {
-	b, err := wslCombinedOutput(exec.Command("wsl.exe", "-l"))
+	// There is a bug in some builds of wsl.exe that causes it to block
+	// indefinitely while executing this operation. Set a timeout so that we don't
+	// get wedged! (Issue #7476)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	b, err := wslCombinedOutput(exec.CommandContext(ctx, "wsl.exe", "-l"))
 	if err != nil {
 		return nil, fmt.Errorf("%v: %q", err, string(b))
 	}
 
-	// The first line of output is a WSL header. E.g.
-	//
-	//	C:\tsdev>wsl.exe -l
-	//	Windows Subsystem for Linux Distributions:
-	//	Ubuntu-20.04 (Default)
-	//
-	// We can skip it by passing '-q', but here we put it to work.
-	// It turns out wsl.exe -l is broken, and outputs UTF-16 names
-	// that nothing can read. (Try `wsl.exe -l | more`.)
-	// So we look at the header to see if it's UTF-16.
-	// If so, we run the rest through a UTF-16 parser.
-	//
-	// https://github.com/microsoft/WSL/issues/4607
-	var output string
-	if bytes.HasPrefix(b, []byte("W\x00i\x00n\x00d\x00o\x00w\x00s\x00")) {
-		output, err = decodeUTF16(b)
-		if err != nil {
-			return nil, fmt.Errorf("failed to decode wsl.exe -l output %q: %v", b, err)
-		}
-	} else {
-		output = string(b)
-	}
-	lines := strings.Split(output, "\n")
+	lines := strings.Split(string(b), "\n")
 	if len(lines) < 1 {
 		return nil, nil
 	}
@@ -64,19 +49,6 @@ func wslDistros() ([]string, error) {
 		distros = append(distros, name)
 	}
 	return distros, nil
-}
-
-func decodeUTF16(b []byte) (string, error) {
-	if len(b) == 0 {
-		return "", nil
-	} else if len(b)%2 != 0 {
-		return "", fmt.Errorf("decodeUTF16: invalid length %d", len(b))
-	}
-	var u16 []uint16
-	for i := 0; i < len(b); i += 2 {
-		u16 = append(u16, uint16(b[i])+(uint16(b[i+1])<<8))
-	}
-	return string(utf16.Decode(u16)), nil
 }
 
 // wslManager is a DNS manager for WSL2 linux distributions.
@@ -99,9 +71,9 @@ func (wm *wslManager) SetDNS(cfg OSConfig) error {
 	} else if len(distros) == 0 {
 		return nil
 	}
-	managers := make(map[string]directManager)
+	managers := make(map[string]*directManager)
 	for _, distro := range distros {
-		managers[distro] = newDirectManagerOnFS(wslFS{
+		managers[distro] = newDirectManagerOnFS(wm.logf, wslFS{
 			user:   "root",
 			distro: distro,
 		})
@@ -141,7 +113,7 @@ generateResolvConf = false
 
 // setWSLConf attempts to disable generateResolvConf in each WSL2 linux.
 // If any are changed, it reports true.
-func (wm *wslManager) setWSLConf(managers map[string]directManager) (changed bool) {
+func (wm *wslManager) setWSLConf(managers map[string]*directManager) (changed bool) {
 	for distro, m := range managers {
 		b, err := m.fs.ReadFile(wslConf)
 		if err != nil && !os.IsNotExist(err) {
@@ -189,9 +161,12 @@ func (fs wslFS) Rename(oldName, newName string) error {
 }
 func (fs wslFS) Remove(name string) error { return wslRun(fs.cmd("rm", "--", name)) }
 
+func (fs wslFS) Truncate(name string) error { return fs.WriteFile(name, nil, 0644) }
+
 func (fs wslFS) ReadFile(name string) ([]byte, error) {
 	b, err := wslCombinedOutput(fs.cmd("cat", "--", name))
-	if ee, _ := err.(*exec.ExitError); ee != nil && ee.ExitCode() == 1 {
+	var ee *exec.ExitError
+	if errors.As(err, &ee) && ee.ExitCode() == 1 {
 		return nil, os.ErrNotExist
 	}
 	return b, err
@@ -223,7 +198,10 @@ func wslCombinedOutput(cmd *exec.Cmd) ([]byte, error) {
 	cmd.Stdout = buf
 	cmd.Stderr = buf
 	err := wslRun(cmd)
-	return buf.Bytes(), err
+	if err != nil {
+		return nil, err
+	}
+	return maybeUnUTF16(buf.Bytes()), nil
 }
 
 func wslRun(cmd *exec.Cmd) (err error) {

@@ -7,6 +7,6 @@ The main motivation is to reduce go.mod dependencies and remove a few tailscale-
 ## Sync source with upstream
 
 ```
-rm -rf atomicfile net types util AUTHORS go.mod go.sum LICENSE
+rm -rf version health envknob logtail atomicfile net types util AUTHORS go.mod go.sum LICENSE
 cd cmd/import-ts-dns; go build; cd ../..; ./cmd/import-ts-dns/import-ts-dns
 ```
