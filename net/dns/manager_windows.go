@@ -392,7 +392,7 @@ func (m windowsManager) getBasePrimaryResolver() (resolvers []netaddr.IP, err er
 
 	ipLoop:
 		for _, stdip := range ips {
-			ip, ok := netaddr.FromStdIP(stdip)
+			ip, ok := netaddr.FromStdIP(stdip.AsSlice())
 			if !ok {
 				continue
 			}
