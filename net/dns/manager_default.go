@@ -5,11 +5,15 @@
 
 package dns
 
-import "github.com/anywherelan/ts-dns/types/logger"
+import (
+	"github.com/anywherelan/ts-dns/control/controlknobs"
+	"github.com/anywherelan/ts-dns/health"
+	"github.com/anywherelan/ts-dns/types/logger"
+)
 
-func NewOSConfigurator(logger.Logf, string) (OSConfigurator, error) {
-	// TODO(dmytro): on darwin, we should use a macOS-specific method such as scutil.
-	// This is currently not implemented. Editing /etc/resolv.conf does not work,
-	// as most applications use the system resolver, which disregards it.
+// NewOSConfigurator creates a new OS configurator.
+//
+// The health tracker and the knobs may be nil and are ignored on this platform.
+func NewOSConfigurator(logger.Logf, *health.Tracker, *controlknobs.Knobs, string) (OSConfigurator, error) {
 	return NewNoopManager()
 }

@@ -14,11 +14,14 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/anywherelan/ts-dns/atomicfile"
+	"github.com/anywherelan/ts-dns/control/controlknobs"
 	"github.com/anywherelan/ts-dns/envknob"
+	"github.com/anywherelan/ts-dns/health"
 	"github.com/anywherelan/ts-dns/types/logger"
 	"github.com/anywherelan/ts-dns/util/dnsname"
 	"github.com/anywherelan/ts-dns/util/winutil"
@@ -36,15 +39,23 @@ var configureWSL = envknob.RegisterBool("TS_DEBUG_CONFIGURE_WSL")
 type windowsManager struct {
 	logf       logger.Logf
 	guid       string
+	knobs      *controlknobs.Knobs // or nil
 	nrptDB     *nrptRuleDatabase
 	wslManager *wslManager
+
+	mu      sync.Mutex
+	closing bool
 }
 
-func NewOSConfigurator(logf logger.Logf, interfaceName string) (OSConfigurator, error) {
+// NewOSConfigurator created a new OS configurator.
+//
+// The health tracker and the knobs may be nil.
+func NewOSConfigurator(logf logger.Logf, health *health.Tracker, knobs *controlknobs.Knobs, interfaceName string) (OSConfigurator, error) {
 	ret := &windowsManager{
 		logf:       logf,
 		guid:       interfaceName,
-		wslManager: newWSLManager(logf),
+		knobs:      knobs,
+		wslManager: newWSLManager(logf, health),
 	}
 
 	if isWindows10OrBetter() {
@@ -64,12 +75,35 @@ func NewOSConfigurator(logf logger.Logf, interfaceName string) (OSConfigurator, 
 }
 
 func (m *windowsManager) openInterfaceKey(pfx winutil.RegistryPathPrefix) (registry.Key, error) {
+	var key registry.Key
+	var err error
 	path := pfx.WithSuffix(m.guid)
-	key, err := winutil.OpenKeyWait(registry.LOCAL_MACHINE, path, registry.SET_VALUE)
+
+	m.mu.Lock()
+	closing := m.closing
+	m.mu.Unlock()
+	if closing {
+		// Do not wait for the interface key to appear if the manager is being closed.
+		// If it's being closed due to the removal of the wintun adapter,
+		// the key would already be gone by now and will not reappear until tailscaled is restarted.
+		key, err = registry.OpenKey(registry.LOCAL_MACHINE, string(path), registry.SET_VALUE)
+	} else {
+		key, err = winutil.OpenKeyWait(registry.LOCAL_MACHINE, path, registry.SET_VALUE)
+	}
 	if err != nil {
 		return 0, fmt.Errorf("opening %s: %w", path, err)
 	}
 	return key, nil
+}
+
+func (m *windowsManager) muteKeyNotFoundIfClosing(err error) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.closing || (!errors.Is(err, windows.ERROR_FILE_NOT_FOUND) && !errors.Is(err, windows.ERROR_PATH_NOT_FOUND)) {
+		return err
+	}
+
+	return nil
 }
 
 func delValue(key registry.Key, name string) error {
@@ -171,7 +205,7 @@ func (m *windowsManager) setHosts(hosts []*HostEntry) error {
 
 	// This can fail spuriously with an access denied error, so retry it a
 	// few times.
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		if err = atomicfile.WriteFile(hostsFile, outB, fileMode); err == nil {
 			return nil
 		}
@@ -205,7 +239,7 @@ func (m *windowsManager) setPrimaryDNS(resolvers []netip.Addr, domains []dnsname
 
 	key4, err := m.openInterfaceKey(winutil.IPv4TCPIPInterfacePrefix)
 	if err != nil {
-		return err
+		return m.muteKeyNotFoundIfClosing(err)
 	}
 	defer key4.Close()
 
@@ -227,7 +261,7 @@ func (m *windowsManager) setPrimaryDNS(resolvers []netip.Addr, domains []dnsname
 
 	key6, err := m.openInterfaceKey(winutil.IPv6TCPIPInterfacePrefix)
 	if err != nil {
-		return err
+		return m.muteKeyNotFoundIfClosing(err)
 	}
 	defer key6.Close()
 
@@ -258,6 +292,10 @@ func (m *windowsManager) setPrimaryDNS(resolvers []netip.Addr, domains []dnsname
 	}
 
 	return nil
+}
+
+func (m *windowsManager) disableLocalDNSOverrideViaNRPT() bool {
+	return m.knobs != nil && m.knobs.DisableLocalDNSOverrideViaNRPT.Load()
 }
 
 func (m *windowsManager) SetDNS(cfg OSConfig) error {
@@ -294,7 +332,17 @@ func (m *windowsManager) SetDNS(cfg OSConfig) error {
 	}
 
 	if len(cfg.MatchDomains) == 0 {
-		if err := m.setSplitDNS(nil, nil); err != nil {
+		var resolvers []netip.Addr
+		var domains []dnsname.FQDN
+		if !m.disableLocalDNSOverrideViaNRPT() {
+			// Create a default catch-all rule to make ourselves the actual primary resolver.
+			// Without this rule, Windows 8.1 and newer devices issue parallel DNS requests to DNS servers
+			// associated with all network adapters, even when "Override local DNS" is enabled and/or
+			// a Mullvad exit node is being used, resulting in DNS leaks.
+			resolvers = cfg.Nameservers
+			domains = []dnsname.FQDN{"."}
+		}
+		if err := m.setSplitDNS(resolvers, domains); err != nil {
 			return err
 		}
 		if err := m.setHosts(nil); err != nil {
@@ -303,8 +351,6 @@ func (m *windowsManager) SetDNS(cfg OSConfig) error {
 		if err := m.setPrimaryDNS(cfg.Nameservers, cfg.SearchDomains); err != nil {
 			return err
 		}
-	} else if m.nrptDB == nil {
-		return errors.New("cannot set per-domain resolvers on Windows 7")
 	} else {
 		if err := m.setSplitDNS(cfg.Nameservers, cfg.MatchDomains); err != nil {
 			return err
@@ -345,7 +391,9 @@ func (m *windowsManager) SetDNS(cfg OSConfig) error {
 		t0 := time.Now()
 		m.logf("running ipconfig /registerdns ...")
 		cmd := exec.Command("ipconfig", "/registerdns")
-		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+		cmd.SysProcAttr = &syscall.SysProcAttr{
+			CreationFlags: windows.DETACHED_PROCESS,
+		}
 		err := cmd.Run()
 		d := time.Since(t0).Round(time.Millisecond)
 		if err != nil {
@@ -357,7 +405,9 @@ func (m *windowsManager) SetDNS(cfg OSConfig) error {
 		t0 = time.Now()
 		m.logf("running ipconfig /flushdns ...")
 		cmd = exec.Command("ipconfig", "/flushdns")
-		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+		cmd.SysProcAttr = &syscall.SysProcAttr{
+			CreationFlags: windows.DETACHED_PROCESS,
+		}
 		err = cmd.Run()
 		d = time.Since(t0).Round(time.Millisecond)
 		if err != nil {
@@ -387,6 +437,14 @@ func (m *windowsManager) SupportsSplitDNS() bool {
 }
 
 func (m *windowsManager) Close() error {
+	m.mu.Lock()
+	if m.closing {
+		m.mu.Unlock()
+		return nil
+	}
+	m.closing = true
+	m.mu.Unlock()
+
 	err := m.SetDNS(OSConfig{})
 	if m.nrptDB != nil {
 		m.nrptDB.Close()
@@ -399,11 +457,24 @@ func (m *windowsManager) Close() error {
 // Windows DHCP client from sending dynamic DNS updates for our interface to
 // AD domain controllers.
 func (m *windowsManager) disableDynamicUpdates() error {
-	if err := m.setSingleDWORD(winutil.IPv4TCPIPInterfacePrefix, "DisableDynamicUpdate", 1); err != nil {
-		return err
+	prefixen := []winutil.RegistryPathPrefix{
+		winutil.IPv4TCPIPInterfacePrefix,
+		winutil.IPv6TCPIPInterfacePrefix,
 	}
-	if err := m.setSingleDWORD(winutil.IPv6TCPIPInterfacePrefix, "DisableDynamicUpdate", 1); err != nil {
-		return err
+
+	for _, prefix := range prefixen {
+		k, err := m.openInterfaceKey(prefix)
+		if err != nil {
+			return m.muteKeyNotFoundIfClosing(err)
+		}
+		defer k.Close()
+
+		if err := k.SetDWordValue("DisableDynamicUpdate", 1); err != nil {
+			return err
+		}
+		if err := k.SetDWordValue("MaxNumberOfAddressesToRegister", 0); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -413,7 +484,7 @@ func (m *windowsManager) disableDynamicUpdates() error {
 func (m *windowsManager) setSingleDWORD(prefix winutil.RegistryPathPrefix, value string, data uint32) error {
 	k, err := m.openInterfaceKey(prefix)
 	if err != nil {
-		return err
+		return m.muteKeyNotFoundIfClosing(err)
 	}
 	defer k.Close()
 	return k.SetDWordValue(value, data)

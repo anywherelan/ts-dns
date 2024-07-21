@@ -17,6 +17,9 @@ var managerFile []byte
 //go:embed files_replacement/envknob.go
 var envknobFile []byte
 
+//go:embed files_replacement/controlknobs.go
+var controlknobsFile []byte
+
 //go:embed files_replacement/health.go
 var healthFile []byte
 
@@ -40,14 +43,14 @@ func main() {
 	netOutputPath := filepath.Join(outputDir, "net")
 	os.MkdirAll(netOutputPath, 0777)
 	copyFiles(filepath.Join(cloneDir, "net", "netaddr"), netOutputPath)
+	copyFiles(filepath.Join(cloneDir, "net", "tsaddr"), netOutputPath)
 	copyFiles(filepath.Join(cloneDir, "net", "dns"), netOutputPath)
-	removeFiles(filepath.Join(outputDir, "net", "dns"), "resolver", "publicdns",
+	removeFiles(filepath.Join(outputDir, "net", "dns"), "resolver", "publicdns", "recursive",
 		"manager.go", "manager_test.go", "manager_linux_test.go", "manager_tcp_test.go", "manager_windows_test.go",
 		"config.go",
 	)
 	os.WriteFile(filepath.Join(outputDir, "net", "dns", "manager.go"), managerFile, 0666)
-	recursiveReplaceInFiles(filepath.Join(outputDir, "net", "dns", "manager_linux.go"), `"github.com/anywherelan/ts-dns/util/clientmetric"`, "")
-	recursiveReplaceInFiles(filepath.Join(outputDir, "net", "dns", "manager_linux.go"), `"strings"`, "")
+	recursiveReplaceInFiles(filepath.Join(outputDir, "net", "dns", "manager_linux.go"), `"tailscale.com/util/clientmetric"`, "")
 	recursiveReplaceInFiles(filepath.Join(outputDir, "net", "dns", "manager_linux.go"),
 		"publishOnce.Do(func() {\n\t\tsanitizedMode := strings.ReplaceAll(mode, \"-\", \"_\")\n\t\tm := clientmetric.NewGauge(fmt.Sprintf(\"dns_manager_linux_mode_%s\", sanitizedMode))\n\t\tm.Set(1)\n\t})",
 		"",
@@ -64,8 +67,18 @@ func main() {
 	copyFiles(filepath.Join(cloneDir, "util", "winutil"), utilOutputPath)
 	copyFiles(filepath.Join(cloneDir, "util", "mak"), utilOutputPath)
 	copyFiles(filepath.Join(cloneDir, "util", "lineread"), utilOutputPath)
+	copyFiles(filepath.Join(cloneDir, "util", "set"), utilOutputPath)
+	copyFiles(filepath.Join(cloneDir, "util", "slicesx"), utilOutputPath)
+	copyFiles(filepath.Join(cloneDir, "util", "multierr"), utilOutputPath)
+	copyFiles(filepath.Join(cloneDir, "util", "ctxkey"), utilOutputPath)
+	copyFiles(filepath.Join(cloneDir, "util", "cibuild"), utilOutputPath)
+	copyFiles(filepath.Join(cloneDir, "util", "must"), utilOutputPath)
+
+	removeFiles(filepath.Join(utilOutputPath, "winutil"), "authenticode", "conpty", "policy", "s4u")
 
 	copyFiles(filepath.Join(cloneDir, "atomicfile"), outputDir)
+
+	copyFiles(filepath.Join(cloneDir, "tstime"), outputDir)
 
 	versionOutputPath := filepath.Join(outputDir, "version")
 	os.MkdirAll(versionOutputPath, 0777)
@@ -80,10 +93,16 @@ func main() {
 	copyFiles(filepath.Join(cloneDir, "types", "logger"), typesOutputPath)
 	removeFiles(filepath.Join(typesOutputPath, "logger"), "logger_test.go")
 	copyFiles(filepath.Join(cloneDir, "types", "lazy"), typesOutputPath)
+	copyFiles(filepath.Join(cloneDir, "types", "ptr"), typesOutputPath)
+	copyFiles(filepath.Join(cloneDir, "types", "views"), typesOutputPath)
 
 	envknobOutputPath := filepath.Join(outputDir, "envknob")
 	os.MkdirAll(envknobOutputPath, 0777)
 	os.WriteFile(filepath.Join(envknobOutputPath, "envknob.go"), envknobFile, 0666)
+
+	controlknobsOutputPath := filepath.Join(outputDir, "control", "controlknobs")
+	os.MkdirAll(controlknobsOutputPath, 0777)
+	os.WriteFile(filepath.Join(controlknobsOutputPath, "controlknobs.go"), controlknobsFile, 0666)
 
 	healthOutputPath := filepath.Join(outputDir, "health")
 	os.MkdirAll(healthOutputPath, 0777)

@@ -7,12 +7,17 @@ import (
 	"bytes"
 	"os"
 
+	"github.com/anywherelan/ts-dns/control/controlknobs"
+	"github.com/anywherelan/ts-dns/health"
 	"github.com/anywherelan/ts-dns/types/logger"
 	"github.com/anywherelan/ts-dns/util/mak"
 	"go4.org/mem"
 )
 
-func NewOSConfigurator(logf logger.Logf, ifName string) (OSConfigurator, error) {
+// NewOSConfigurator creates a new OS configurator.
+//
+// The health tracker and the knobs may be nil and are ignored on this platform.
+func NewOSConfigurator(logf logger.Logf, _ *health.Tracker, _ *controlknobs.Knobs, ifName string) (OSConfigurator, error) {
 	return &darwinConfigurator{logf: logf, ifName: ifName}, nil
 }
 
@@ -36,15 +41,11 @@ func (c *darwinConfigurator) SupportsSplitDNS() bool {
 func (c *darwinConfigurator) SetDNS(cfg OSConfig) error {
 	var buf bytes.Buffer
 	buf.WriteString(macResolverFileHeader)
-	for i, ip := range cfg.Nameservers {
-		if i == 0 {
-			buf.WriteString("nameserver ")
-		} else {
-			buf.WriteString(" ")
-		}
+	for _, ip := range cfg.Nameservers {
+		buf.WriteString("nameserver ")
 		buf.WriteString(ip.String())
+		buf.WriteString("\n")
 	}
-	buf.WriteString("\n")
 
 	if err := os.MkdirAll("/etc/resolver", 0755); err != nil {
 		return err
