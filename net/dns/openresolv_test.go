@@ -105,7 +105,7 @@ func TestOpenresolvGetBaseConfig(t *testing.T) {
 			// snippet, so "resolvconf -l" must not be run at all, lest
 			// openresolv hand our own config back as our upstream.
 			name:       "only_tailscale_registered",
-			resolvconf: fakeResolvconf{listOut: "tailscale\n"},
+			resolvconf: fakeResolvconf{listOut: "awl-dns\n"},
 			wantArgv:   []string{"-i"},
 		},
 		{
@@ -133,7 +133,7 @@ func TestOpenresolvGetBaseConfig(t *testing.T) {
 		{
 			name: "tailscale_among_others",
 			resolvconf: fakeResolvconf{
-				listOut: "eth0 tailscale wlan0\n",
+				listOut: "eth0 awl-dns wlan0\n",
 				// Diagnostics on stderr must never be parsed as snippet names.
 				listErr: "No resolv.conf for key bogus\n",
 				dumpOut: eth0Dump,

@@ -29,7 +29,7 @@ const (
 	// This is the legacy rule ID that previous versions used when we supported
 	// only a single rule. Now that we support multiple rules are required, we
 	// generate their GUIDs and store them under the Tailscale registry key.
-	nrptSingleRuleID = `{5abe529b-675b-4486-8459-25a634dacc23}`
+	nrptSingleRuleID = `{19de8089-fd3b-49d5-ac12-8834fb37ddfa}`
 
 	// This is the name of the registry value we use to save Rule IDs under
 	// the Tailscale registry key.

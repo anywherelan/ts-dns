@@ -193,11 +193,11 @@ func (m *windowsManager) setSplitDNS(resolvers []netip.Addr, domains []dnsname.F
 func setTailscaleHosts(logf logger.Logf, prevHostsFile []byte, hosts []*HostEntry) ([]byte, error) {
 	sc := bufio.NewScanner(bytes.NewReader(prevHostsFile))
 	const (
-		header = "# TailscaleHostsSectionStart"
-		footer = "# TailscaleHostsSectionEnd"
+		header = "# AwlDnsHostsSectionStart"
+		footer = "# AwlDnsHostsSectionEnd"
 	)
 	comments := []string{
-		"# This section contains MagicDNS entries for Tailscale.",
+		"# This section contains DNS entries added by awl-dns.",
 		"# Do not edit this section manually.",
 	}
 

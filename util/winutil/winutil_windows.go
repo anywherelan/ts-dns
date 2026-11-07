@@ -25,8 +25,8 @@ import (
 )
 
 const (
-	regBase       = `SOFTWARE\Tailscale IPN`
-	regPolicyBase = `SOFTWARE\Policies\Tailscale`
+	regBase       = `SOFTWARE\awl-dns`
+	regPolicyBase = `SOFTWARE\Policies\awl-dns`
 )
 
 // ErrNoShell is returned when the shell process is not found.

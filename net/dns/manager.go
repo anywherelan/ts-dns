@@ -15,7 +15,7 @@ var osConfigurationSetWarnable = health.Register(&health.Warnable{
 	Code:  "dns-set-os-config-failed",
 	Title: "Failed to set system DNS configuration",
 	Text: func(args health.Args) string {
-		return fmt.Sprintf("Tailscale failed to set the DNS configuration of your device: %v", args[health.ArgError])
+		return fmt.Sprintf("Failed to set the DNS configuration of your device: %v", args[health.ArgError])
 	},
 	Severity: health.SeverityMedium,
 })

@@ -23,12 +23,12 @@
 
 set -e
 
-if [ -n "$TAILSCALE_RESOLVCONF_HOOK_LOOP" ]; then
+if [ -n "$AWL_DNS_RESOLVCONF_HOOK_LOOP" ]; then
 	# Hook script being invoked by itself, skip.
 	exit 0
 fi
 
-if [ ! -f tun-tailscale.inet ]; then
+if [ ! -f tun-awl-dns.inet ]; then
 	# Tailscale isn't trying to manage DNS, do nothing.
 	exit 0
 fi
@@ -43,8 +43,8 @@ fi
 	if [ -f /etc/resolvconf/resolv.conf.d/head ]; then
 		cat /etc/resolvconf/resolv.conf.d/head
 	fi
-	echo "# Tailscale workaround applied to set exclusive DNS configuration."
-	cat tun-tailscale.inet
+	echo "# awl-dns workaround applied to set exclusive DNS configuration."
+	cat tun-awl-dns.inet
 	if [ -f /etc/resolvconf/resolv.conf.d/base ]; then
 		# Keep options and sortlist, discard other base things since
 		# they're the things we're trying to override.
@@ -57,6 +57,6 @@ fi
 
 if [ -d /etc/resolvconf/update-libc.d ] ; then
 	# Re-notify libc watchers that we've changed resolv.conf again.
-	export TAILSCALE_RESOLVCONF_HOOK_LOOP=1
+	export AWL_DNS_RESOLVCONF_HOOK_LOOP=1
 	exec run-parts /etc/resolvconf/update-libc.d
 fi

@@ -95,7 +95,7 @@ func (m openresolvManager) readSnippets(args ...string) ([]byte, error) {
 }
 
 func (m openresolvManager) deleteTailscaleConfig() error {
-	cmd := exec.Command("resolvconf", "-f", "-d", "tailscale")
+	cmd := exec.Command("resolvconf", "-f", "-d", "awl-dns")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		m.logCmdErr(cmd, err)
@@ -112,7 +112,7 @@ func (m openresolvManager) SetDNS(config OSConfig) error {
 	var stdin bytes.Buffer
 	writeResolvConf(&stdin, config.Nameservers, config.SearchDomains)
 
-	cmd := exec.Command("resolvconf", "-m", "0", "-x", "-a", "tailscale")
+	cmd := exec.Command("resolvconf", "-m", "0", "-x", "-a", "awl-dns")
 	cmd.Stdin = &stdin
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -136,7 +136,7 @@ func (m openresolvManager) GetBaseConfig() (OSConfig, error) {
 	}
 
 	others := slices.DeleteFunc(strings.Fields(string(bs)), func(f string) bool {
-		return f == "tailscale"
+		return f == "awl-dns"
 	})
 	if len(others) == 0 {
 		// There are no other snippets, so there is no base config to read.

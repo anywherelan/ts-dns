@@ -92,7 +92,7 @@ func (c *darwinConfigurator) SetDNS(cfg OSConfig) error {
 	// Add a dummy file to /etc/resolver with a "search ..." directive if we have
 	// search suffixes to add.
 	if len(cfg.SearchDomains) > 0 {
-		const searchFile = "search.tailscale" // fake DNS suffix+TLD to put our search
+		const searchFile = "search.awl-dns" // fake DNS suffix+TLD to put our search
 		mak.Set(&keep, searchFile, true)
 		var sbuf bytes.Buffer
 		sbuf.WriteString(macResolverFileHeader)
@@ -127,7 +127,7 @@ func (c *darwinConfigurator) SetDNS(cfg OSConfig) error {
 // tailscaled's global DNS resolver. The UUID does not identify a real network
 // service; it just gives tailscaled one well-known dynamic-store location to
 // set and later remove.
-const macOSGlobalDNSKey = "State:/Network/Service/FF457792-79C0-4A25-8392-D875BBEACCA6/DNS"
+const macOSGlobalDNSKey = "State:/Network/Service/7684586D-DC71-4B5E-86FA-BEFA8549E73A/DNS"
 
 // setGlobalDNS installs cfg.Nameservers as a default resolver using
 // SystemConfiguration's dynamic store. /etc/resolver is only a split-DNS
@@ -253,7 +253,7 @@ func (c *darwinConfigurator) GetBaseConfig() (OSConfig, error) {
 	return cfg, nil
 }
 
-const macResolverFileHeader = "# Added by tailscaled\n"
+const macResolverFileHeader = "# Added by awl-dns\n"
 
 // removeResolverFiles deletes all files in /etc/resolver for which the shouldDelete
 // func returns true.

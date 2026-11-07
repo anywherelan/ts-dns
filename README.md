@@ -20,9 +20,15 @@ Upstream tests are kept only for `net/dns`, other packages are copied verbatim a
 
 ## Usage notes
 
+- The names the configurators use in the OS are different from upstream, so they don't collide with
+  tailscale installed on the same machine: the resolv.conf header and backup file, resolvconf and openresolv
+  records, macOS resolver files and SystemConfiguration key, the Windows hosts file section, NRPT and policy
+  registry keys. Config left with upstream names is treated as foreign.
+
 - On linux in direct mode (plain `/etc/resolv.conf`, no systemd-resolved or NetworkManager) the configurator
   can watch the file and report when another program (e.g. a DHCP client) overwrites it.
   The watcher is enabled by importing `_ "github.com/anywherelan/ts-dns/feature/linuxdnsfight"`.
+  The import works on any OS, outside linux the package is empty.
   It logs the overwrite and publishes `dns.TrampleDNS` on the `eventbus.Bus` passed to `NewOSConfigurator`;
   subscribe to it with `eventbus.SubscribeFunc` and call `SetDNS` again to restore the config.
   Upstream does the same in `dns.Manager`, which is not part of this fork.
