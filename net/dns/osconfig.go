@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package dns
@@ -8,8 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"slices"
 	"strings"
 
+	"github.com/anywherelan/ts-dns/feature/buildfeatures"
+	"github.com/anywherelan/ts-dns/types/dnstype"
 	"github.com/anywherelan/ts-dns/types/logger"
 	"github.com/anywherelan/ts-dns/util/dnsname"
 )
@@ -34,7 +37,9 @@ type OSConfigurator interface {
 	// Only works when SupportsSplitDNS=false.
 
 	// Implementations that don't support getting the base config must
-	// return ErrGetBaseConfigNotSupported.
+	// return ErrGetBaseConfigNotSupported. Implementations that can read the
+	// configuration but cannot recover any underlying resolvers may return
+	// ErrGetBaseConfigNoResolvers; other read failures should return their error.
 	GetBaseConfig() (OSConfig, error)
 	// Close removes Tailscale-related DNS configuration from the OS.
 	Close() error
@@ -64,6 +69,15 @@ type OSConfig struct {
 	// from the OS, which will only work with OSConfigurators that
 	// report SupportsSplitDNS()=true.
 	MatchDomains []dnsname.FQDN
+	// Resolvers is the full-fidelity form of Nameservers, populated only by
+	// OSConfigurators whose [OSConfigurator.GetBaseConfig] can recover more
+	// of the underlying resolver configuration than plain IP:53 addresses
+	// (non-standard ports, DoH/DoT endpoints). It is input to the DNS
+	// manager only: the manager blends it into quad-100's catch-all route
+	// when the tunnel resolver must serve as the OS primary. It is never
+	// applied to the OS itself, and [OSConfig.Equal] deliberately ignores
+	// it, because it does not affect the configuration installed on the OS.
+	Resolvers []*dnstype.Resolver `json:",omitempty"`
 }
 
 func (o *OSConfig) WriteToBufioWriter(w *bufio.Writer) {
@@ -103,10 +117,17 @@ func (o *OSConfig) WriteToBufioWriter(w *bufio.Writer) {
 }
 
 func (o OSConfig) IsZero() bool {
-	return len(o.Nameservers) == 0 && len(o.SearchDomains) == 0 && len(o.MatchDomains) == 0
+	return len(o.Hosts) == 0 &&
+		len(o.Nameservers) == 0 &&
+		len(o.SearchDomains) == 0 &&
+		len(o.MatchDomains) == 0 &&
+		len(o.Resolvers) == 0
 }
 
 func (a OSConfig) Equal(b OSConfig) bool {
+	if len(a.Hosts) != len(b.Hosts) {
+		return false
+	}
 	if len(a.Nameservers) != len(b.Nameservers) {
 		return false
 	}
@@ -117,6 +138,15 @@ func (a OSConfig) Equal(b OSConfig) bool {
 		return false
 	}
 
+	for i := range a.Hosts {
+		ha, hb := a.Hosts[i], b.Hosts[i]
+		if ha.Addr != hb.Addr {
+			return false
+		}
+		if !slices.Equal(ha.Hosts, hb.Hosts) {
+			return false
+		}
+	}
 	for i := range a.Nameservers {
 		if a.Nameservers[i] != b.Nameservers[i] {
 			return false
@@ -142,6 +172,10 @@ func (a OSConfig) Equal(b OSConfig) bool {
 // Fixes https://github.com/tailscale/tailscale/issues/5669
 func (a OSConfig) Format(f fmt.State, verb rune) {
 	logger.ArgWriter(func(w *bufio.Writer) {
+		if !buildfeatures.HasDNS {
+			w.WriteString(`{DNS-unlinked}`)
+			return
+		}
 		w.WriteString(`{Nameservers:[`)
 		for i, ns := range a.Nameservers {
 			if i != 0 {
@@ -178,3 +212,8 @@ func (a OSConfig) Format(f fmt.State, verb rune) {
 // OSConfigurator.GetBaseConfig returns when the OSConfigurator
 // doesn't support reading the underlying configuration out of the OS.
 var ErrGetBaseConfigNotSupported = errors.New("getting OS base config is not supported")
+
+// ErrGetBaseConfigNoResolvers is returned by [OSConfigurator.GetBaseConfig]
+// when neither a fresh read nor a retained configuration supplies an underlying
+// resolver. It produces the same health warning as a successful but empty read.
+var ErrGetBaseConfigNoResolvers = errEmptyBaseConfig

@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package winutil
@@ -17,7 +17,6 @@ import (
 	"unsafe"
 
 	"github.com/anywherelan/ts-dns/types/logger"
-	"github.com/anywherelan/ts-dns/util/multierr"
 	"github.com/dblohm7/wingoes"
 	"golang.org/x/sys/windows"
 )
@@ -538,7 +537,7 @@ func (rps RestartableProcesses) Terminate(logf logger.Logf, exitCode uint32, tim
 	}
 
 	if len(errs) != 0 {
-		return multierr.New(errs...)
+		return errors.Join(errs...)
 	}
 	return nil
 }

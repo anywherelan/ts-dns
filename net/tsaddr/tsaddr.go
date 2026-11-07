@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package tsaddr handles Tailscale-specific IPs and ranges.
@@ -7,6 +7,7 @@ package tsaddr
 import (
 	"encoding/binary"
 	"errors"
+	"iter"
 	"net/netip"
 	"slices"
 	"sync"
@@ -66,13 +67,21 @@ const (
 	TailscaleServiceIPv6String = "fd7a:115c:a1e0::53"
 )
 
-// IsTailscaleIP reports whether ip is an IP address in a range that
+// IsTailscaleIP reports whether IP is an IP address in a range that
 // Tailscale assigns from.
 func IsTailscaleIP(ip netip.Addr) bool {
+	ip = ip.Unmap()
 	if ip.Is4() {
-		return CGNATRange().Contains(ip) && !ChromeOSVMRange().Contains(ip)
+		return IsTailscaleIPv4(ip)
 	}
 	return TailscaleULARange().Contains(ip)
+}
+
+// IsTailscaleIPv4 reports whether an IPv4 IP is an IP address that
+// Tailscale assigns from.
+// It will always return false if ip is an "IPv4-mapped IPv6 address".
+func IsTailscaleIPv4(ip netip.Addr) bool {
+	return CGNATRange().Contains(ip) && !ChromeOSVMRange().Contains(ip)
 }
 
 // TailscaleULARange returns the IPv6 Unique Local Address range that
@@ -180,8 +189,7 @@ func PrefixIs6(p netip.Prefix) bool { return p.Addr().Is6() }
 // IPv6 /0 route.
 func ContainsExitRoutes(rr views.Slice[netip.Prefix]) bool {
 	var v4, v6 bool
-	for i := range rr.Len() {
-		r := rr.At(i)
+	for _, r := range rr.All() {
 		if r == allIPv4 {
 			v4 = true
 		} else if r == allIPv6 {
@@ -191,15 +199,58 @@ func ContainsExitRoutes(rr views.Slice[netip.Prefix]) bool {
 	return v4 && v6
 }
 
-// ContainsNonExitSubnetRoutes reports whether v contains Subnet
-// Routes other than ExitNode Routes.
-func ContainsNonExitSubnetRoutes(rr views.Slice[netip.Prefix]) bool {
-	for i := range rr.Len() {
-		if rr.At(i).Bits() != 0 {
+// ContainsExitRoute reports whether rr contains at least one of IPv4 or
+// IPv6 /0 (exit) routes.
+func ContainsExitRoute(rr views.Slice[netip.Prefix]) bool {
+	for _, r := range rr.All() {
+		if r.Bits() == 0 {
 			return true
 		}
 	}
 	return false
+}
+
+// ContainsNonExitSubnetRoutes reports whether v contains Subnet
+// Routes other than ExitNode Routes.
+func ContainsNonExitSubnetRoutes(rr views.Slice[netip.Prefix]) bool {
+	for _, r := range rr.All() {
+		if r.Bits() != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// WithoutExitRoutes returns rr unchanged if it has only 1 or 0 /0
+// routes. If it has both IPv4 and IPv6 /0 routes, then it returns
+// a copy with all /0 routes removed.
+func WithoutExitRoutes(rr views.Slice[netip.Prefix]) views.Slice[netip.Prefix] {
+	if !ContainsExitRoutes(rr) {
+		return rr
+	}
+	var out []netip.Prefix
+	for _, r := range rr.All() {
+		if r.Bits() > 0 {
+			out = append(out, r)
+		}
+	}
+	return views.SliceOf(out)
+}
+
+// WithoutExitRoute returns rr unchanged if it has 0 /0
+// routes. If it has a IPv4 or IPv6 /0 routes, then it returns
+// a copy with all /0 routes removed.
+func WithoutExitRoute(rr views.Slice[netip.Prefix]) views.Slice[netip.Prefix] {
+	if !ContainsExitRoute(rr) {
+		return rr
+	}
+	var out []netip.Prefix
+	for _, r := range rr.All() {
+		if r.Bits() > 0 {
+			out = append(out, r)
+		}
+	}
+	return views.SliceOf(out)
 }
 
 var (
@@ -215,6 +266,11 @@ func AllIPv6() netip.Prefix { return allIPv6 }
 
 // ExitRoutes returns a slice containing AllIPv4 and AllIPv6.
 func ExitRoutes() []netip.Prefix { return []netip.Prefix{allIPv4, allIPv6} }
+
+// IsExitRoute reports whether p is an exit node route.
+func IsExitRoute(p netip.Prefix) bool {
+	return p == allIPv4 || p == allIPv6
+}
 
 // SortPrefixes sorts the prefixes in place.
 func SortPrefixes(p []netip.Prefix) {
@@ -263,4 +319,25 @@ func MapVia(siteID uint32, v4 netip.Prefix) (via netip.Prefix, err error) {
 	ip4a := v4.Addr().As4()
 	copy(a[12:], ip4a[:])
 	return netip.PrefixFrom(netip.AddrFrom16(a), v4.Bits()+64+32), nil
+}
+
+// FirstTailscaleAddrs returns the first Tailscale IPv4 address and
+// the first Tailscale IPv6 address among the addresses of addrs'
+// prefixes, if any. The addrs sequence is typically a node's own
+// address list, either a slice (via [slices.All]) or a view (via
+// [views.Slice.All]).
+func FirstTailscaleAddrs(addrs iter.Seq2[int, netip.Prefix]) (a4, a6 netip.Addr) {
+	for _, pfx := range addrs {
+		a := pfx.Addr()
+		switch {
+		case a.Is4() && !a4.IsValid() && IsTailscaleIP(a):
+			a4 = a
+		case a.Is6() && !a6.IsValid() && IsTailscaleIP(a):
+			a6 = a
+		}
+		if a4.IsValid() && a6.IsValid() {
+			break
+		}
+	}
+	return a4, a6
 }

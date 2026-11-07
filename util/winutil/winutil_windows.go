@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package winutil
@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"os"
 	"os/exec"
 	"os/user"
+	"path/filepath"
 	"reflect"
 	"runtime"
 	"strings"
@@ -33,6 +35,10 @@ var ErrNoShell = errors.New("no Shell process is present")
 // ErrNoValue is returned when the value doesn't exist in the registry.
 var ErrNoValue = registry.ErrNotExist
 
+// ErrBadRegValueFormat is returned when a string value does not match the
+// expected format.
+var ErrBadRegValueFormat = errors.New("registry value formatted incorrectly")
+
 // GetDesktopPID searches the PID of the process that's running the
 // currently active desktop. Returns ErrNoShell if the shell is not present.
 // Usually the PID will be for explorer.exe.
@@ -52,7 +58,7 @@ func GetDesktopPID() (uint32, error) {
 }
 
 func getPolicyString(name string) (string, error) {
-	s, err := getRegStringInternal(regPolicyBase, name)
+	s, err := getRegStringInternal(registry.LOCAL_MACHINE, regPolicyBase, name)
 	if err != nil {
 		// Fall back to the legacy path
 		return getRegString(name)
@@ -65,7 +71,7 @@ func getPolicyStringArray(name string) ([]string, error) {
 }
 
 func getRegString(name string) (string, error) {
-	s, err := getRegStringInternal(regBase, name)
+	s, err := getRegStringInternal(registry.LOCAL_MACHINE, regBase, name)
 	if err != nil {
 		return "", err
 	}
@@ -89,8 +95,8 @@ func getRegInteger(name string) (uint64, error) {
 	return i, err
 }
 
-func getRegStringInternal(subKey, name string) (string, error) {
-	key, err := registry.OpenKey(registry.LOCAL_MACHINE, subKey, registry.READ)
+func getRegStringInternal(key registry.Key, subKey, name string) (string, error) {
+	key, err := registry.OpenKey(key, subKey, registry.READ)
 	if err != nil {
 		if err != ErrNoValue {
 			log.Printf("registry.OpenKey(%v): %v", subKey, err)
@@ -107,6 +113,24 @@ func getRegStringInternal(subKey, name string) (string, error) {
 		return "", err
 	}
 	return val, nil
+}
+
+// GetRegUserString looks up a registry path in the current user key, or returns
+// an empty string and error.
+func GetRegUserString(name string) (string, error) {
+	return getRegStringInternal(registry.CURRENT_USER, regBase, name)
+}
+
+// SetRegUserString sets a SZ value identified by name in the current user key
+// to the string specified by value.
+func SetRegUserString(name, value string) error {
+	key, _, err := registry.CreateKey(registry.CURRENT_USER, regBase, registry.SET_VALUE)
+	if err != nil {
+		log.Printf("registry.CreateKey(%v): %v", regBase, err)
+	}
+	defer key.Close()
+
+	return key.SetStringValue(name, value)
 }
 
 // GetRegStrings looks up a registry value in the local machine path, or returns
@@ -139,7 +163,7 @@ func getRegStringsInternal(subKey, name string) ([]string, error) {
 	return val, nil
 }
 
-// SetRegStrings sets a MULTI_SZ value in the in the local machine path
+// SetRegStrings sets a MULTI_SZ value in the local machine path
 // to the strings specified by values.
 func SetRegStrings(name string, values []string) error {
 	return setRegStringsInternal(regBase, name, values)
@@ -553,7 +577,7 @@ func lookupPseudoUser(uid string) (*user.User, error) {
 	}
 
 	// We're looking for SIDs "S-1-5-x" where 17 <= x <= 20.
-	// This is checking for the the "5"
+	// This is checking for the "5"
 	if sid.IdentifierAuthority() != windows.SECURITY_NT_AUTHORITY {
 		return nil, fmt.Errorf(`SID %q does not use "NT AUTHORITY"`, uid)
 	}
@@ -928,4 +952,45 @@ func IsDomainName(name string) (bool, error) {
 	}
 
 	return isDomainName(name16)
+}
+
+// GUIPathFromReg obtains the path to the client GUI executable from the
+// registry value that was written during installation.
+func GUIPathFromReg() (string, error) {
+	regPath, err := GetRegString("GUIPath")
+	if err != nil {
+		return "", err
+	}
+
+	if !filepath.IsAbs(regPath) {
+		return "", ErrBadRegValueFormat
+	}
+
+	if _, err := os.Stat(regPath); err != nil {
+		return "", err
+	}
+
+	return regPath, nil
+}
+
+// IsCurrentProcessLocalSystem checks whether the current process is running
+// as LocalSystem.
+func IsCurrentProcessLocalSystem() bool {
+	localSystem, err := windows.CreateWellKnownSid(windows.WinLocalSystemSid)
+	if err != nil {
+		return false
+	}
+
+	token := windows.GetCurrentProcessToken()
+	// The current process token is a pseudo-handle so we don't need to close it.
+	if ok, err := token.IsMember(localSystem); err != nil || !ok {
+		return false
+	}
+
+	u, err := token.GetTokenUser()
+	if err != nil {
+		return false
+	}
+
+	return u.User.Sid.Equals(localSystem)
 }

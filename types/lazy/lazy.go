@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package lazy provides types for lazily initialized values.
@@ -7,13 +7,11 @@ package lazy
 import (
 	"sync"
 	"sync/atomic"
-
-	"github.com/anywherelan/ts-dns/types/ptr"
 )
 
 // nilErrPtr is a sentinel *error value for SyncValue.err to signal
 // that SyncValue.v is valid.
-var nilErrPtr = ptr.To[error](nil)
+var nilErrPtr = new(error(nil))
 
 // SyncValue is a lazily computed value.
 //
@@ -23,6 +21,9 @@ var nilErrPtr = ptr.To[error](nil)
 // Recursive use of a SyncValue from its own fill function will deadlock.
 //
 // SyncValue is safe for concurrent use.
+//
+// Unlike [sync.OnceValue], the linker can do better dead code elimination
+// with SyncValue. See https://github.com/golang/go/issues/62202.
 type SyncValue[T any] struct {
 	once sync.Once
 	v    T
@@ -77,7 +78,7 @@ func (z *SyncValue[T]) GetErr(fill func() (T, error)) (T, error) {
 
 		// Update z.err after z.v; see field docs.
 		if err != nil {
-			z.err.Store(ptr.To(err))
+			z.err.Store(new(err))
 		} else {
 			z.err.Store(nilErrPtr)
 		}
@@ -120,37 +121,39 @@ func (z *SyncValue[T]) PeekErr() (v T, err error, ok bool) {
 	return zero, nil, false
 }
 
-// SyncFunc wraps a function to make it lazy.
-//
-// The returned function calls fill the first time it's called, and returns
-// fill's result on every subsequent call.
-//
-// The returned function is safe for concurrent use.
-func SyncFunc[T any](fill func() T) func() T {
-	var (
-		once sync.Once
-		v    T
-	)
-	return func() T {
-		once.Do(func() { v = fill() })
-		return v
-	}
+// testing_TB is a subset of testing.TB that we use to set up test helpers.
+// It's defined here to avoid pulling in the testing package.
+type testing_TB interface {
+	Helper()
+	Cleanup(func())
 }
 
-// SyncFuncErr wraps a function to make it lazy.
+// SetForTest sets z's value and error.
+// It's used in tests only and reverts z's state back when tb and all its
+// subtests complete.
+// It is not safe for concurrent use and must not be called concurrently with
+// any SyncValue methods, including another call to itself.
 //
-// The returned function calls fill the first time it's called, and returns
-// fill's results on every subsequent call.
-//
-// The returned function is safe for concurrent use.
-func SyncFuncErr[T any](fill func() (T, error)) func() (T, error) {
-	var (
-		once sync.Once
-		v    T
-		err  error
-	)
-	return func() (T, error) {
-		once.Do(func() { v, err = fill() })
-		return v, err
+// The provided tb should be a [*testing.T] or [*testing.B].
+func (z *SyncValue[T]) SetForTest(tb testing_TB, val T, err error) {
+	tb.Helper()
+
+	oldErr, oldVal := z.err.Load(), z.v
+	z.once.Do(func() {})
+
+	z.v = val
+	if err != nil {
+		z.err.Store(new(err))
+	} else {
+		z.err.Store(nilErrPtr)
 	}
+
+	tb.Cleanup(func() {
+		if oldErr == nil {
+			*z = SyncValue[T]{}
+		} else {
+			z.v = oldVal
+			z.err.Store(oldErr)
+		}
+	})
 }

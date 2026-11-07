@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package dns
@@ -8,23 +8,29 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io/fs"
+	"maps"
 	"net/netip"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
-	"sync"
-	"syscall"
 	"time"
 
 	"github.com/anywherelan/ts-dns/atomicfile"
 	"github.com/anywherelan/ts-dns/control/controlknobs"
 	"github.com/anywherelan/ts-dns/envknob"
 	"github.com/anywherelan/ts-dns/health"
+	"github.com/anywherelan/ts-dns/syncs"
 	"github.com/anywherelan/ts-dns/types/logger"
 	"github.com/anywherelan/ts-dns/util/dnsname"
+	"github.com/anywherelan/ts-dns/util/eventbus"
+	"github.com/anywherelan/ts-dns/util/syspolicy/pkey"
+	"github.com/anywherelan/ts-dns/util/syspolicy/policyclient"
+	"github.com/anywherelan/ts-dns/util/syspolicy/ptype"
 	"github.com/anywherelan/ts-dns/util/winutil"
+	"github.com/anywherelan/ts-dns/util/winutil/winenv"
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
 	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
@@ -36,30 +42,54 @@ const (
 
 var configureWSL = envknob.RegisterBool("TS_DEBUG_CONFIGURE_WSL")
 
+// disableHostsFileUpdatesLocal allows local diagnosis of expensive Windows
+// DNS Client hosts-file reloads without changing the tailnet policy.
+// On Windows, set it in %ProgramData%\Tailscale\tailscaled-env.txt and restart.
+var disableHostsFileUpdatesLocal = envknob.RegisterBool("TS_DEBUG_DISABLE_HOSTS_FILE_UPDATES")
+
 type windowsManager struct {
 	logf       logger.Logf
 	guid       string
 	knobs      *controlknobs.Knobs // or nil
 	nrptDB     *nrptRuleDatabase
 	wslManager *wslManager
+	polc       policyclient.Client
+	doV4       bool
+	doV6       bool
+	doNetBIOS  bool
 
-	mu      sync.Mutex
+	unregisterPolicyChangeCb func() // called when the manager is closing
+
+	mu      syncs.Mutex
 	closing bool
 }
 
 // NewOSConfigurator created a new OS configurator.
 //
-// The health tracker and the knobs may be nil.
-func NewOSConfigurator(logf logger.Logf, health *health.Tracker, knobs *controlknobs.Knobs, interfaceName string) (OSConfigurator, error) {
+// The health tracker, eventbus and the knobs may be nil.
+func NewOSConfigurator(logf logger.Logf, health *health.Tracker, bus *eventbus.Bus, polc policyclient.Client, knobs *controlknobs.Knobs, interfaceName string) (OSConfigurator, error) {
+	if polc == nil {
+		panic("nil policyclient.Client")
+	}
 	ret := &windowsManager{
 		logf:       logf,
 		guid:       interfaceName,
 		knobs:      knobs,
+		polc:       polc,
 		wslManager: newWSLManager(logf, health),
+	}
+
+	if err := ret.checkInterfaces(); err != nil {
+		return nil, err
 	}
 
 	if isWindows10OrBetter() {
 		ret.nrptDB = newNRPTRuleDatabase(logf)
+	}
+
+	var err error
+	if ret.unregisterPolicyChangeCb, err = polc.RegisterChangeCallback("", ret.sysPolicyChanged); err != nil {
+		logf("error registering policy change callback: %v", err) // non-fatal
 	}
 
 	go func() {
@@ -74,22 +104,42 @@ func NewOSConfigurator(logf logger.Logf, health *health.Tracker, knobs *controlk
 	return ret, nil
 }
 
-func (m *windowsManager) openInterfaceKey(pfx winutil.RegistryPathPrefix) (registry.Key, error) {
-	var key registry.Key
-	var err error
-	path := pfx.WithSuffix(m.guid)
-
-	m.mu.Lock()
-	closing := m.closing
-	m.mu.Unlock()
-	if closing {
-		// Do not wait for the interface key to appear if the manager is being closed.
-		// If it's being closed due to the removal of the wintun adapter,
-		// the key would already be gone by now and will not reappear until tailscaled is restarted.
-		key, err = registry.OpenKey(registry.LOCAL_MACHINE, string(path), registry.SET_VALUE)
-	} else {
-		key, err = winutil.OpenKeyWait(registry.LOCAL_MACHINE, path, registry.SET_VALUE)
+func (m *windowsManager) checkInterfaces() error {
+	guid, err := windows.GUIDFromString(m.guid)
+	if err != nil {
+		return err
 	}
+
+	luid, err := winipcfg.LUIDFromGUID(&guid)
+	if err != nil {
+		return err
+	}
+
+	_, err = luid.IPInterface(windows.AF_INET)
+	if err != nil && !errors.Is(err, windows.ERROR_NOT_FOUND) {
+		return fmt.Errorf("getting AF_INET interface: %w", err)
+	}
+	m.doV4 = err == nil
+
+	_, err = luid.IPInterface(windows.AF_INET6)
+	if err != nil && !errors.Is(err, windows.ERROR_NOT_FOUND) {
+		return fmt.Errorf("getting AF_INET6 interface: %w", err)
+	}
+	m.doV6 = err == nil
+
+	if !m.doV4 && !m.doV6 {
+		return errors.New("no IP interfaces available for dns configuration")
+	}
+
+	// NetBIOS is non-fatal
+	_, err = luid.IPInterface(windows.AF_NETBIOS)
+	m.doNetBIOS = err == nil
+	return nil
+}
+
+func (m *windowsManager) openInterfaceKey(pfx winutil.RegistryPathPrefix) (registry.Key, error) {
+	path := pfx.WithSuffix(m.guid)
+	key, err := registry.OpenKey(registry.LOCAL_MACHINE, string(path), registry.SET_VALUE)
 	if err != nil {
 		return 0, fmt.Errorf("opening %s: %w", path, err)
 	}
@@ -127,7 +177,7 @@ func (m *windowsManager) setSplitDNS(resolvers []netip.Addr, domains []dnsname.F
 		return fmt.Errorf("Split DNS unsupported on this Windows version")
 	}
 
-	defer m.nrptDB.Refresh()
+	defer m.nrptDB.NotifyPolicyChanged()
 	if len(resolvers) == 0 {
 		return m.nrptDB.DelAllRuleKeys()
 	}
@@ -140,17 +190,42 @@ func (m *windowsManager) setSplitDNS(resolvers []netip.Addr, domains []dnsname.F
 	return m.nrptDB.WriteSplitDNSConfig(servers, domains)
 }
 
-func setTailscaleHosts(prevHostsFile []byte, hosts []*HostEntry) ([]byte, error) {
-	b := bytes.ReplaceAll(prevHostsFile, []byte("\r\n"), []byte("\n"))
-	sc := bufio.NewScanner(bytes.NewReader(b))
+func setTailscaleHosts(logf logger.Logf, prevHostsFile []byte, hosts []*HostEntry) ([]byte, error) {
+	sc := bufio.NewScanner(bytes.NewReader(prevHostsFile))
 	const (
 		header = "# TailscaleHostsSectionStart"
 		footer = "# TailscaleHostsSectionEnd"
 	)
-	var comments = []string{
+	comments := []string{
 		"# This section contains MagicDNS entries for Tailscale.",
 		"# Do not edit this section manually.",
 	}
+
+	prevEntries := make(map[netip.Addr][]string)
+	addPrevEntry := func(line string) {
+		if line == "" || line[0] == '#' {
+			return
+		}
+
+		parts := strings.Split(line, " ")
+		if len(parts) < 1 {
+			return
+		}
+
+		addr, err := netip.ParseAddr(parts[0])
+		if err != nil {
+			logf("Parsing address from hosts: %v", err)
+			return
+		}
+
+		prevEntries[addr] = parts[1:]
+	}
+
+	nextEntries := make(map[netip.Addr][]string, len(hosts))
+	for _, he := range hosts {
+		nextEntries[he.Addr] = he.Hosts
+	}
+
 	var out bytes.Buffer
 	var inSection bool
 	for sc.Scan() {
@@ -164,26 +239,34 @@ func setTailscaleHosts(prevHostsFile []byte, hosts []*HostEntry) ([]byte, error)
 			continue
 		}
 		if inSection {
+			addPrevEntry(line)
 			continue
 		}
-		fmt.Fprintln(&out, line)
+		fmt.Fprintf(&out, "%s\r\n", line)
 	}
 	if err := sc.Err(); err != nil {
 		return nil, err
 	}
-	if len(hosts) > 0 {
-		fmt.Fprintln(&out, header)
-		for _, c := range comments {
-			fmt.Fprintln(&out, c)
-		}
-		fmt.Fprintln(&out)
-		for _, he := range hosts {
-			fmt.Fprintf(&out, "%s %s\n", he.Addr, strings.Join(he.Hosts, " "))
-		}
-		fmt.Fprintln(&out)
-		fmt.Fprintln(&out, footer)
+
+	unchanged := maps.EqualFunc(prevEntries, nextEntries, func(a, b []string) bool {
+		return slices.Equal(a, b)
+	})
+	if unchanged {
+		return nil, nil
 	}
-	return bytes.ReplaceAll(out.Bytes(), []byte("\n"), []byte("\r\n")), nil
+
+	if len(hosts) > 0 {
+		fmt.Fprintf(&out, "%s\r\n", header)
+		for _, c := range comments {
+			fmt.Fprintf(&out, "%s\r\n", c)
+		}
+		fmt.Fprintf(&out, "\r\n")
+		for _, he := range hosts {
+			fmt.Fprintf(&out, "%s %s\r\n", he.Addr, strings.Join(he.Hosts, " "))
+		}
+		fmt.Fprintf(&out, "\r\n%s\r\n", footer)
+	}
+	return out.Bytes(), nil
 }
 
 // setHosts sets the hosts file to contain the given host entries.
@@ -194,13 +277,24 @@ func (m *windowsManager) setHosts(hosts []*HostEntry) error {
 	}
 	hostsFile := filepath.Join(systemDir, "drivers", "etc", "hosts")
 	b, err := os.ReadFile(hostsFile)
+	switch {
+	case err == nil:
+		// Continue.
+	case errors.Is(err, fs.ErrNotExist):
+		// Non-fatal, we'll just create a new hosts file.
+		m.logf("failed to read the hosts file: %v", err)
+	default:
+		return err
+	}
+	outB, err := setTailscaleHosts(m.logf, b, hosts)
 	if err != nil {
 		return err
 	}
-	outB, err := setTailscaleHosts(b, hosts)
-	if err != nil {
-		return err
+	if outB == nil {
+		// No change to hosts file, therefore no write necessary.
+		return nil
 	}
+
 	const fileMode = 0 // ignored on windows.
 
 	// This can fail spuriously with an access denied error, so retry it a
@@ -237,58 +331,66 @@ func (m *windowsManager) setPrimaryDNS(resolvers []netip.Addr, domains []dnsname
 		domStrs = append(domStrs, dom.WithoutTrailingDot())
 	}
 
-	key4, err := m.openInterfaceKey(winutil.IPv4TCPIPInterfacePrefix)
-	if err != nil {
-		return m.muteKeyNotFoundIfClosing(err)
-	}
-	defer key4.Close()
+	if m.doV4 {
+		key4, err := m.openInterfaceKey(winutil.IPv4TCPIPInterfacePrefix)
+		if err != nil {
+			return m.muteKeyNotFoundIfClosing(err)
+		}
+		defer key4.Close()
 
-	if len(ipsv4) == 0 {
-		if err := delValue(key4, "NameServer"); err != nil {
+		if len(ipsv4) == 0 {
+			if err := delValue(key4, "NameServer"); err != nil {
+				return err
+			}
+		} else if err := key4.SetStringValue("NameServer", strings.Join(ipsv4, ",")); err != nil {
 			return err
 		}
-	} else if err := key4.SetStringValue("NameServer", strings.Join(ipsv4, ",")); err != nil {
-		return err
-	}
 
-	if len(domains) == 0 {
-		if err := delValue(key4, "SearchList"); err != nil {
+		if len(domains) == 0 {
+			if err := delValue(key4, "SearchList"); err != nil {
+				return err
+			}
+		} else if err := key4.SetStringValue("SearchList", strings.Join(domStrs, ",")); err != nil {
 			return err
 		}
-	} else if err := key4.SetStringValue("SearchList", strings.Join(domStrs, ",")); err != nil {
-		return err
-	}
 
-	key6, err := m.openInterfaceKey(winutil.IPv6TCPIPInterfacePrefix)
-	if err != nil {
-		return m.muteKeyNotFoundIfClosing(err)
-	}
-	defer key6.Close()
-
-	if len(ipsv6) == 0 {
-		if err := delValue(key6, "NameServer"); err != nil {
+		// Disable LLMNR on the Tailscale interface. We don't do multicast, and we
+		// certainly don't do LLMNR, so it's pointless to make Windows try it. It is
+		// being deprecated.
+		if err := key4.SetDWordValue("EnableMulticast", 0); err != nil {
 			return err
 		}
-	} else if err := key6.SetStringValue("NameServer", strings.Join(ipsv6, ",")); err != nil {
-		return err
 	}
 
-	if len(domains) == 0 {
-		if err := delValue(key6, "SearchList"); err != nil {
+	if m.doV6 {
+		key6, err := m.openInterfaceKey(winutil.IPv6TCPIPInterfacePrefix)
+		if err != nil {
+			return m.muteKeyNotFoundIfClosing(err)
+		}
+		defer key6.Close()
+
+		if len(ipsv6) == 0 {
+			if err := delValue(key6, "NameServer"); err != nil {
+				return err
+			}
+		} else if err := key6.SetStringValue("NameServer", strings.Join(ipsv6, ",")); err != nil {
 			return err
 		}
-	} else if err := key6.SetStringValue("SearchList", strings.Join(domStrs, ",")); err != nil {
-		return err
-	}
 
-	// Disable LLMNR on the Tailscale interface. We don't do multicast, and we
-	// certainly don't do LLMNR, so it's pointless to make Windows try it. It is
-	// being deprecated.
-	if err := key4.SetDWordValue("EnableMulticast", 0); err != nil {
-		return err
-	}
-	if err := key6.SetDWordValue("EnableMulticast", 0); err != nil {
-		return err
+		if len(domains) == 0 {
+			if err := delValue(key6, "SearchList"); err != nil {
+				return err
+			}
+		} else if err := key6.SetStringValue("SearchList", strings.Join(domStrs, ",")); err != nil {
+			return err
+		}
+
+		// Disable LLMNR on the Tailscale interface. We don't do multicast, and we
+		// certainly don't do LLMNR, so it's pointless to make Windows try it. It is
+		// being deprecated.
+		if err := key6.SetDWordValue("EnableMulticast", 0); err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -296,6 +398,10 @@ func (m *windowsManager) setPrimaryDNS(resolvers []netip.Addr, domains []dnsname
 
 func (m *windowsManager) disableLocalDNSOverrideViaNRPT() bool {
 	return m.knobs != nil && m.knobs.DisableLocalDNSOverrideViaNRPT.Load()
+}
+
+func (m *windowsManager) disableHostsFileUpdates() bool {
+	return disableHostsFileUpdatesLocal() || (m.knobs != nil && m.knobs.DisableHostsFileUpdates.Load())
 }
 
 func (m *windowsManager) SetDNS(cfg OSConfig) error {
@@ -322,11 +428,9 @@ func (m *windowsManager) SetDNS(cfg OSConfig) error {
 	// configuration only, routing one set of things to the "split"
 	// resolver and the rest to the primary.
 
-	// Unconditionally disable dynamic DNS updates and NetBIOS on our
-	// interfaces.
-	if err := m.disableDynamicUpdates(); err != nil {
-		m.logf("disableDynamicUpdates error: %v\n", err)
-	}
+	// Reconfigure DNS registration according to the [syspolicy.DNSRegistration]
+	// policy setting, and unconditionally disable NetBIOS on our interfaces.
+	m.reconfigureDNSRegistration()
 	if err := m.disableNetBIOS(); err != nil {
 		m.logf("disableNetBIOS error: %v\n", err)
 	}
@@ -345,7 +449,15 @@ func (m *windowsManager) SetDNS(cfg OSConfig) error {
 		if err := m.setSplitDNS(resolvers, domains); err != nil {
 			return err
 		}
-		if err := m.setHosts(nil); err != nil {
+		var hosts []*HostEntry
+		if !m.disableHostsFileUpdates() && winenv.IsDomainJoined() {
+			// On domain-joined Windows devices the primary search domain (the one the device is joined to)
+			// always takes precedence over other search domains. This breaks MagicDNS when we are the primary
+			// resolver on the device (see #18712). To work around this Windows behavior, we should write MagicDNS
+			// host names the hosts file just as we do when we're not the primary resolver.
+			hosts = cfg.Hosts
+		}
+		if err := m.setHosts(hosts); err != nil {
 			return err
 		}
 		if err := m.setPrimaryDNS(cfg.Nameservers, cfg.SearchDomains); err != nil {
@@ -367,12 +479,14 @@ func (m *windowsManager) SetDNS(cfg OSConfig) error {
 			return err
 		}
 
-		// As we are not the primary resolver in this setup, we need to
-		// explicitly set some single name hosts to ensure that we can resolve
-		// them quickly and get around the 2.3s delay that otherwise occurs due
-		// to multicast timeouts.
-		if err := m.setHosts(cfg.Hosts); err != nil {
-			return err
+		if !m.disableHostsFileUpdates() {
+			// As we are not the primary resolver in this setup, we need to
+			// explicitly set some single name hosts to ensure that we can resolve
+			// them quickly and get around the 2.3s delay that otherwise occurs due
+			// to multicast timeouts.
+			if err := m.setHosts(cfg.Hosts); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -382,40 +496,15 @@ func (m *windowsManager) SetDNS(cfg OSConfig) error {
 	// have changed, which makes the DNS settings actually take
 	// effect.
 	//
-	// This command can take a few seconds to run, so run it async, best effort.
-	//
 	// After re-registering DNS, also flush the DNS cache to clear out
 	// any cached split-horizon queries that are no longer the correct
 	// answer.
-	go func() {
-		t0 := time.Now()
-		m.logf("running ipconfig /registerdns ...")
-		cmd := exec.Command("ipconfig", "/registerdns")
-		cmd.SysProcAttr = &syscall.SysProcAttr{
-			CreationFlags: windows.DETACHED_PROCESS,
-		}
-		err := cmd.Run()
-		d := time.Since(t0).Round(time.Millisecond)
-		if err != nil {
-			m.logf("error running ipconfig /registerdns after %v: %v", d, err)
-		} else {
-			m.logf("ran ipconfig /registerdns in %v", d)
-		}
-
-		t0 = time.Now()
-		m.logf("running ipconfig /flushdns ...")
-		cmd = exec.Command("ipconfig", "/flushdns")
-		cmd.SysProcAttr = &syscall.SysProcAttr{
-			CreationFlags: windows.DETACHED_PROCESS,
-		}
-		err = cmd.Run()
-		d = time.Since(t0).Round(time.Millisecond)
-		if err != nil {
-			m.logf("error running ipconfig /flushdns after %v: %v", d, err)
-		} else {
-			m.logf("ran ipconfig /flushdns in %v", d)
-		}
-	}()
+	//
+	// Both operations are non-blocking and coalesced: at most one of
+	// each is in flight at a time, with at most one more queued.
+	m.logf("Re-registering DNS and flushing cache")
+	registerDNS()
+	Flush()
 
 	// On initial setup of WSL, the restart caused by --shutdown is slow,
 	// so we do it out-of-line.
@@ -445,6 +534,10 @@ func (m *windowsManager) Close() error {
 	m.closing = true
 	m.mu.Unlock()
 
+	if m.unregisterPolicyChangeCb != nil {
+		m.unregisterPolicyChangeCb()
+	}
+
 	err := m.SetDNS(OSConfig{})
 	if m.nrptDB != nil {
 		m.nrptDB.Close()
@@ -453,13 +546,63 @@ func (m *windowsManager) Close() error {
 	return err
 }
 
-// disableDynamicUpdates sets the appropriate registry values to prevent the
-// Windows DHCP client from sending dynamic DNS updates for our interface to
-// AD domain controllers.
-func (m *windowsManager) disableDynamicUpdates() error {
-	prefixen := []winutil.RegistryPathPrefix{
-		winutil.IPv4TCPIPInterfacePrefix,
-		winutil.IPv6TCPIPInterfacePrefix,
+// sysPolicyChanged is a callback triggered by [syspolicy] when it detects
+// a change in one or more syspolicy settings.
+func (m *windowsManager) sysPolicyChanged(policy policyclient.PolicyChange) {
+	if policy.HasChanged(pkey.EnableDNSRegistration) {
+		m.reconfigureDNSRegistration()
+	}
+}
+
+// reconfigureDNSRegistration configures the DNS registration settings
+// using the [syspolicy.DNSRegistration] policy setting, if it is set.
+// If the policy is not configured, it disables DNS registration.
+func (m *windowsManager) reconfigureDNSRegistration() {
+	// Disable DNS registration by default (if the policy setting is not configured).
+	// This is primarily for historical reasons and to avoid breaking existing
+	// setups that rely on this behavior.
+	enableDNSRegistration, err := m.polc.GetPreferenceOption(pkey.EnableDNSRegistration, ptype.NeverByPolicy)
+	if err != nil {
+		m.logf("error getting DNSRegistration policy setting: %v", err) // non-fatal; we'll use the default
+	}
+
+	if enableDNSRegistration.Show() {
+		// "Show" reports whether the policy setting is configured as "user-decides".
+		// The name is a bit unfortunate in this context, as we don't actually "show" anything.
+		// Still, if the admin configured the policy as "user-decides", we shouldn't modify
+		// the adapter's settings and should leave them up to the user (admin rights required)
+		// or the system defaults.
+		return
+	}
+
+	// Otherwise, if the policy setting is configured as "always" or "never",
+	// we should configure the adapter accordingly.
+	if err := m.configureDNSRegistration(enableDNSRegistration.IsAlways()); err != nil {
+		m.logf("error configuring DNS registration: %v", err)
+	}
+}
+
+// configureDNSRegistration sets the appropriate registry values to allow or prevent
+// the Windows DHCP client from registering Tailscale IP addresses with DNS
+// and sending dynamic updates for our interface to AD domain controllers.
+func (m *windowsManager) configureDNSRegistration(enabled bool) error {
+	prefixen := make([]winutil.RegistryPathPrefix, 0, 2)
+	if m.doV4 {
+		prefixen = append(prefixen, winutil.IPv4TCPIPInterfacePrefix)
+	}
+	if m.doV6 {
+		prefixen = append(prefixen, winutil.IPv6TCPIPInterfacePrefix)
+	}
+
+	var (
+		registrationEnabled            = uint32(0)
+		disableDynamicUpdate           = uint32(1)
+		maxNumberOfAddressesToRegister = uint32(0)
+	)
+	if enabled {
+		registrationEnabled = 1
+		disableDynamicUpdate = 0
+		maxNumberOfAddressesToRegister = 1
 	}
 
 	for _, prefix := range prefixen {
@@ -469,10 +612,13 @@ func (m *windowsManager) disableDynamicUpdates() error {
 		}
 		defer k.Close()
 
-		if err := k.SetDWordValue("DisableDynamicUpdate", 1); err != nil {
+		if err := k.SetDWordValue("RegistrationEnabled", registrationEnabled); err != nil {
 			return err
 		}
-		if err := k.SetDWordValue("MaxNumberOfAddressesToRegister", 0); err != nil {
+		if err := k.SetDWordValue("DisableDynamicUpdate", disableDynamicUpdate); err != nil {
+			return err
+		}
+		if err := k.SetDWordValue("MaxNumberOfAddressesToRegister", maxNumberOfAddressesToRegister); err != nil {
 			return err
 		}
 	}
@@ -499,6 +645,10 @@ func (m *windowsManager) setSingleDWORD(prefix winutil.RegistryPathPrefix, value
 // Further, LLMNR and NetBIOS are being deprecated anyway in favor of MDNS.
 // https://techcommunity.microsoft.com/t5/networking-blog/aligning-on-mdns-ramping-down-netbios-name-resolution-and-llmnr/ba-p/3290816
 func (m *windowsManager) disableNetBIOS() error {
+	if !m.doNetBIOS {
+		return nil
+	}
+
 	return m.setSingleDWORD(winutil.NetBTInterfacePrefix, "NetbiosOptions", 2)
 }
 

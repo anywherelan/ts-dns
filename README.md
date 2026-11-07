@@ -7,6 +7,27 @@ The main motivation is to reduce go.mod dependencies and remove a few tailscale-
 ## Sync source with upstream
 
 ```
-rm -rf version health envknob logtail atomicfile net types util tstime AUTHORS go.mod go.sum LICENSE
-cd cmd/import-ts-dns; go build; cd ../..; ./cmd/import-ts-dns/import-ts-dns; rm ./cmd/import-ts-dns/import-ts-dns
+go -C cmd/import-ts-dns build -o ../../import-ts-dns . && ./import-ts-dns; rm ./import-ts-dns
 ```
+
+The script clones upstream, copies the needed packages, replaces some of them with stubs from
+`cmd/import-ts-dns/files_replacement` and checks that everything builds (for linux, windows, darwin, freebsd),
+passes `go vet` and tests. Only if the checks pass, the previously generated dirs are removed and replaced with the new output.
+
+Only packages reachable from non-test code of `net/dns` are copied (`go list -deps ./net/dns` for each GOOS shows them),
+plus `feature/linuxdnsfight`.
+Upstream tests are kept only for `net/dns`, other packages are copied verbatim and tested upstream.
+
+## Usage notes
+
+- On linux in direct mode (plain `/etc/resolv.conf`, no systemd-resolved or NetworkManager) the configurator
+  can watch the file and report when another program (e.g. a DHCP client) overwrites it.
+  The watcher is enabled by importing `_ "github.com/anywherelan/ts-dns/feature/linuxdnsfight"`.
+  It logs the overwrite and publishes `dns.TrampleDNS` on the `eventbus.Bus` passed to `NewOSConfigurator`;
+  subscribe to it with `eventbus.SubscribeFunc` and call `SetDNS` again to restore the config.
+  Upstream does the same in `dns.Manager`, which is not part of this fork.
+- `NewOSConfigurator` panics on windows if the policy client is nil, pass `policyclient.NoPolicyClient{}`.
+
+If upstream changed and the build fails, fix the script and run it again with `-keep`:
+the upstream clone is then kept in `temp-clone-dir` and reused on the next run instead of cloning again.
+Remove `temp-clone-dir` when done.

@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package logger defines a type for writing to logs. It's just a
@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -22,6 +23,9 @@ import (
 
 	"github.com/anywherelan/ts-dns/envknob"
 	"github.com/anywherelan/ts-dns/util/ctxkey"
+	"github.com/anywherelan/ts-dns/util/testenv"
+	jsonv2 "github.com/go-json-experiment/json"
+	jsonv1 "github.com/go-json-experiment/json/v1"
 	"go4.org/mem"
 )
 
@@ -139,6 +143,7 @@ var rateFree = []string{
 	"magicsock: disco: ",
 	"magicsock: ParseEndpoint:",
 	// grinder stats lines
+	"magicsock: new contact: ",
 	"SetPrefs: %v",
 	"peer keys: %s",
 	"v%v peers: %v",
@@ -160,6 +165,10 @@ func RateLimitedFn(logf Logf, f time.Duration, burst int, maxCache int) Logf {
 // rate limits.
 func RateLimitedFnWithClock(logf Logf, f time.Duration, burst int, maxCache int, timeNow func() time.Time) Logf {
 	if envknob.String("TS_DEBUG_LOG_RATE") == "all" {
+		return logf
+	}
+	if runtime.GOOS == "plan9" {
+		// To ease bring-up.
 		return logf
 	}
 	var (
@@ -317,6 +326,7 @@ func (fn ArgWriter) Format(f fmt.State, _ rune) {
 	bw.Reset(f)
 	fn(bw)
 	bw.Flush()
+	bw.Reset(io.Discard)
 	argBufioPool.Put(bw)
 }
 
@@ -371,24 +381,19 @@ func AsJSON(v any) fmt.Formatter {
 type asJSONResult struct{ v any }
 
 func (a asJSONResult) Format(s fmt.State, verb rune) {
-	v, err := json.Marshal(a.v)
+	// Write directly to s rather than going through json.Marshal's
+	// returned []byte to avoid an allocation. The explicit v1
+	// options keep the output identical to encoding/json.
+	err := jsonv2.MarshalWrite(s, a.v, jsonv1.DefaultOptionsV1())
 	if err != nil {
 		fmt.Fprintf(s, "%%!JSON-ERROR:%v", err)
-		return
 	}
-	s.Write(v)
-}
-
-// TBLogger is the testing.TB subset needed by TestLogger.
-type TBLogger interface {
-	Helper()
-	Logf(format string, args ...any)
 }
 
 // TestLogger returns a logger that logs to tb.Logf
 // with a prefix to make it easier to distinguish spam
 // from explicit test failures.
-func TestLogger(tb TBLogger) Logf {
+func TestLogger(tb testenv.TB) Logf {
 	return func(format string, args ...any) {
 		tb.Helper()
 		tb.Logf("    ... "+format, args...)

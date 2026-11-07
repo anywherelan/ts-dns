@@ -1,7 +1,7 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
-//go:build !linux && !freebsd && !openbsd && !windows && !darwin
+//go:build (!linux || android) && !freebsd && !openbsd && !windows && !darwin && !illumos && !solaris && !plan9
 
 package dns
 
@@ -9,11 +9,13 @@ import (
 	"github.com/anywherelan/ts-dns/control/controlknobs"
 	"github.com/anywherelan/ts-dns/health"
 	"github.com/anywherelan/ts-dns/types/logger"
+	"github.com/anywherelan/ts-dns/util/eventbus"
+	"github.com/anywherelan/ts-dns/util/syspolicy/policyclient"
 )
 
 // NewOSConfigurator creates a new OS configurator.
 //
 // The health tracker and the knobs may be nil and are ignored on this platform.
-func NewOSConfigurator(logger.Logf, *health.Tracker, *controlknobs.Knobs, string) (OSConfigurator, error) {
+func NewOSConfigurator(logger.Logf, *health.Tracker, *eventbus.Bus, policyclient.Client, *controlknobs.Knobs, string) (OSConfigurator, error) {
 	return NewNoopManager()
 }

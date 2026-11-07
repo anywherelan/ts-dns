@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package winutil
@@ -35,9 +35,11 @@ const (
 
 // Mitigation flags from the Win32 SDK
 const (
-	PROCESS_CREATION_MITIGATION_POLICY_IMAGE_LOAD_NO_REMOTE_ALWAYS_ON       = (1 << 52)
-	PROCESS_CREATION_MITIGATION_POLICY_IMAGE_LOAD_NO_LOW_LABEL_ALWAYS_ON    = (1 << 56)
-	PROCESS_CREATION_MITIGATION_POLICY_IMAGE_LOAD_PREFER_SYSTEM32_ALWAYS_ON = (1 << 60)
+	PROCESS_CREATION_MITIGATION_POLICY_EXTENSION_POINT_DISABLE_ALWAYS_ON      = (1 << 32)
+	PROCESS_CREATION_MITIGATION_POLICY_BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON = (1 << 44)
+	PROCESS_CREATION_MITIGATION_POLICY_IMAGE_LOAD_NO_REMOTE_ALWAYS_ON         = (1 << 52)
+	PROCESS_CREATION_MITIGATION_POLICY_IMAGE_LOAD_NO_LOW_LABEL_ALWAYS_ON      = (1 << 56)
+	PROCESS_CREATION_MITIGATION_POLICY_IMAGE_LOAD_PREFER_SYSTEM32_ALWAYS_ON   = (1 << 60)
 )
 
 // StartupInfoBuilder constructs a Windows STARTUPINFOEX and optional
@@ -81,8 +83,8 @@ func (sib *StartupInfoBuilder) Resolve() (startupInfo *windows.StartupInfo, inhe
 	// Always create a Unicode environment.
 	createProcessFlags = windows.CREATE_UNICODE_ENVIRONMENT
 
-	if l := uint32(len(sib.attrs)); l > 0 {
-		attrCont, err := windows.NewProcThreadAttributeList(l)
+	if ln := uint32(len(sib.attrs)); ln > 0 {
+		attrCont, err := windows.NewProcThreadAttributeList(ln)
 		if err != nil {
 			return nil, false, 0, err
 		}
@@ -154,7 +156,7 @@ func canBeInherited(h windows.Handle) bool {
 
 // SetStdHandles sets the StdInput, StdOutput, and StdErr handles and configures
 // their inheritability as needed. When the handles are valid, non-console
-// kernel objects, sib takes ownership of of them. All three handles may be set
+// kernel objects, sib takes ownership of them. All three handles may be set
 // to zero to indicate that the parent's std handles should not be implicitly
 // inherited.
 //

@@ -43,6 +43,7 @@ var (
 
 	procImpersonateLoggedOnUser    = modadvapi32.NewProc("ImpersonateLoggedOnUser")
 	procEnterCriticalPolicySection = moduserenv.NewProc("EnterCriticalPolicySection")
+	procGenerateGPNotification     = moduserenv.NewProc("GenerateGPNotification")
 	procLeaveCriticalPolicySection = moduserenv.NewProc("LeaveCriticalPolicySection")
 	procRefreshPolicyEx            = moduserenv.NewProc("RefreshPolicyEx")
 	procRegisterGPNotification     = moduserenv.NewProc("RegisterGPNotification")
@@ -50,7 +51,7 @@ var (
 )
 
 func impersonateLoggedOnUser(token windows.Token) (err error) {
-	r1, _, e1 := syscall.Syscall(procImpersonateLoggedOnUser.Addr(), 1, uintptr(token), 0, 0)
+	r1, _, e1 := syscall.SyscallN(procImpersonateLoggedOnUser.Addr(), uintptr(token))
 	if int32(r1) == 0 {
 		err = errnoErr(e1)
 	}
@@ -62,7 +63,7 @@ func enterCriticalPolicySection(machine bool) (handle policyLockHandle, err erro
 	if machine {
 		_p0 = 1
 	}
-	r0, _, e1 := syscall.Syscall(procEnterCriticalPolicySection.Addr(), 1, uintptr(_p0), 0, 0)
+	r0, _, e1 := syscall.SyscallN(procEnterCriticalPolicySection.Addr(), uintptr(_p0))
 	handle = policyLockHandle(r0)
 	if int32(handle) == 0 {
 		err = errnoErr(e1)
@@ -70,8 +71,24 @@ func enterCriticalPolicySection(machine bool) (handle policyLockHandle, err erro
 	return
 }
 
+func generateGPNotification(machine bool, mgmtProduct *uint16, mgmtProductOptions uint32) (ret error) {
+	ret = procGenerateGPNotification.Find()
+	if ret != nil {
+		return
+	}
+	var _p0 uint32
+	if machine {
+		_p0 = 1
+	}
+	r0, _, _ := syscall.SyscallN(procGenerateGPNotification.Addr(), uintptr(_p0), uintptr(unsafe.Pointer(mgmtProduct)), uintptr(mgmtProductOptions))
+	if r0 != 0 {
+		ret = syscall.Errno(r0)
+	}
+	return
+}
+
 func leaveCriticalPolicySection(handle policyLockHandle) (err error) {
-	r1, _, e1 := syscall.Syscall(procLeaveCriticalPolicySection.Addr(), 1, uintptr(handle), 0, 0)
+	r1, _, e1 := syscall.SyscallN(procLeaveCriticalPolicySection.Addr(), uintptr(handle))
 	if int32(r1) == 0 {
 		err = errnoErr(e1)
 	}
@@ -83,7 +100,7 @@ func refreshPolicyEx(machine bool, flags uint32) (err error) {
 	if machine {
 		_p0 = 1
 	}
-	r1, _, e1 := syscall.Syscall(procRefreshPolicyEx.Addr(), 2, uintptr(_p0), uintptr(flags), 0)
+	r1, _, e1 := syscall.SyscallN(procRefreshPolicyEx.Addr(), uintptr(_p0), uintptr(flags))
 	if int32(r1) == 0 {
 		err = errnoErr(e1)
 	}
@@ -95,7 +112,7 @@ func registerGPNotification(event windows.Handle, machine bool) (err error) {
 	if machine {
 		_p0 = 1
 	}
-	r1, _, e1 := syscall.Syscall(procRegisterGPNotification.Addr(), 2, uintptr(event), uintptr(_p0), 0)
+	r1, _, e1 := syscall.SyscallN(procRegisterGPNotification.Addr(), uintptr(event), uintptr(_p0))
 	if int32(r1) == 0 {
 		err = errnoErr(e1)
 	}
@@ -103,7 +120,7 @@ func registerGPNotification(event windows.Handle, machine bool) (err error) {
 }
 
 func unregisterGPNotification(event windows.Handle) (err error) {
-	r1, _, e1 := syscall.Syscall(procUnregisterGPNotification.Addr(), 1, uintptr(event), 0, 0)
+	r1, _, e1 := syscall.SyscallN(procUnregisterGPNotification.Addr(), uintptr(event))
 	if int32(r1) == 0 {
 		err = errnoErr(e1)
 	}
